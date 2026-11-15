@@ -1,11 +1,21 @@
 import 'dotenv/config';
+import fs from 'fs';
+import readline from 'readline';
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, downloadMediaMessage } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
 import pino from 'pino';
 import { GoogleGenAI } from '@google/genai';
 
-// Initialize the official Gemini client (reads process.env.GEMINI_API_KEY automatically)
+// Initialize Gemini client (automatically reads process.env.GEMINI_API_KEY)
 const ai = new GoogleGenAI({});
+
+// Ordered fallback list for Gemini models (handles 429 quota limits & 503 busy errors)
+const AI_MODELS = [
+    'gemini-3.6-flash',
+    'gemini-3.8-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-2.5-flash'
+];
 
 // ==========================================
 // 1. API HELPER FUNCTIONS (IGDB, TMDB, GEMINI)
@@ -33,8 +43,6 @@ async function searchIGDB(query) {
         });
 
         const rawData = await igdbRes.json();
-        console.log('[IGDB API] Raw Response Data:', JSON.stringify(rawData, null, 2));
-
         if (!rawData || rawData.length === 0) {
             return { text: `❌ No games found matching "${query}" on IGDB.` };
         }
@@ -44,12 +52,13 @@ async function searchIGDB(query) {
         const rating = game.total_rating ? Math.round(game.total_rating) + '/100' : 'N/A';
         const summary = game.summary ? game.summary.slice(0, 300) + '...' : 'No summary available.';
         const platformsList = game.platforms ? game.platforms.map(p => p.name).join(', ') : 'Not specified';
-        
-        const sharknyLink = `\n\n🔗 *View on Sharkny:* https://sharkny-three.vercel.app/games/${game.id}`;
-        
+
+        const sharknyLink = `\n\n🔗 *View on Sharkny:* https://sharkny-three.vercel.app/game/${game.id}`;
         const captionText = `🎮 *${game.name}* (${releaseYear})\n\n⭐ *Rating:* ${rating}\n\n🖥️ *Platforms:* ${platformsList}\n\n📝 *Overview:* ${summary}${sharknyLink}`;
 
-        let imageUrl = game.cover?.image_id ? `https://images.igdb.com/igdb/image/upload/t_cover_big/${game.cover.image_id}.jpg` : null;
+        const imageUrl = game.cover?.image_id
+            ? `https://images.igdb.com/igdb/image/upload/t_cover_big/${game.cover.image_id}.jpg`
+            : null;
 
         return { image: imageUrl ? { url: imageUrl } : null, text: captionText };
     } catch (error) {
@@ -66,11 +75,9 @@ async function searchTMDB(mediaType, query) {
 
     try {
         const endpoint = mediaType === 'tv' ? 'tv' : 'movie';
-        const searchUrl = `https://api.themoviedb.org/3/search/${endpoint}?query=${encodeURIComponent(query)}`;
-
         console.log(`[TMDB API] Searching ${endpoint} for: "${query}"`);
 
-        const searchRes = await fetch(searchUrl, {
+        const searchRes = await fetch(`https://api.themoviedb.org/3/search/${endpoint}?query=${encodeURIComponent(query)}`, {
             headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' }
         });
 
@@ -79,21 +86,12 @@ async function searchTMDB(mediaType, query) {
             return { text: `❌ No results found matching "${query}" on TMDB.` };
         }
 
-        // Get the ID of the first match from search results
-        const firstItem = searchData.results[0];
-        const itemId = firstItem.id;
-
-        // Fetch full details endpoint to get exact runtime (movies) or seasons/episodes (tv)
-        const detailsUrl = `https://api.themoviedb.org/3/${endpoint}/${itemId}`;
-        console.log(`[TMDB API] Fetching details for ID ${itemId} from ${detailsUrl}`);
-
-        const detailsRes = await fetch(detailsUrl, {
+        const itemId = searchData.results[0].id;
+        const detailsRes = await fetch(`https://api.themoviedb.org/3/${endpoint}/${itemId}`, {
             headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' }
         });
 
         const item = await detailsRes.json();
-        console.log('[TMDB API] Raw Details Data:', JSON.stringify(item, null, 2));
-
         const title = item.title || item.name || 'Unknown Title';
         const rawDate = item.release_date || item.first_air_date;
         const releaseYear = rawDate ? new Date(rawDate).getFullYear() : 'Unknown';
@@ -111,11 +109,10 @@ async function searchTMDB(mediaType, query) {
         }
 
         const typeEmoji = mediaType === 'tv' ? '📺' : '🎬';
-        const sharknyLink = `\n\n🔗 *View on Sharkny:* https://sharkny-three.vercel.app/sharkny/tv/${item.id}`;
-
+        const sharknyLink = `\n\n🔗 *View on Sharkny:* https://sharkny-three.vercel.app/tv/${item.id}`;
         const captionText = `${typeEmoji} *${title}* (${releaseYear})\n\n⭐ *Rating:* ${rating}${extraStats}\n\n📝 *Overview:* ${overview}${sharknyLink}`;
 
-        let imageUrl = item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null;
+        const imageUrl = item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null;
 
         return { image: imageUrl ? { url: imageUrl } : null, text: captionText };
     } catch (error) {
@@ -125,71 +122,36 @@ async function searchTMDB(mediaType, query) {
 }
 
 async function handleAI(args, msg, sock) {
+    const jid = msg.key.remoteJid;
     const contextInfo = msg.message?.extendedTextMessage?.contextInfo;
     const quotedMessage = contextInfo?.quotedMessage;
-    
+
     let quotedText = '';
     let quotedImageBuffer = null;
 
     if (quotedMessage) {
-        quotedText = 
-            quotedMessage.conversation || 
-            quotedMessage.extendedTextMessage?.text || 
-            quotedMessage.imageMessage?.caption || 
+        quotedText =
+            quotedMessage.conversation ||
+            quotedMessage.extendedTextMessage?.text ||
+            quotedMessage.imageMessage?.caption ||
             '';
 
         if (quotedMessage.imageMessage) {
             try {
-                console.log('[Gemini API] Downloading quoted image for analysis...');
-                const stream = await downloadMediaMessage(
+                console.log('[Gemini API] Downloading quoted image...');
+                quotedImageBuffer = await downloadMediaMessage(
                     { message: quotedMessage },
                     'buffer',
                     {},
                     { logger: pino({ level: 'silent' }) }
                 );
-                quotedImageBuffer = stream;
             } catch (err) {
                 console.error('Failed to download image from quoted message:', err);
             }
         }
     }
 
-    const isImageGenerationRequest = 
-        args.toLowerCase().startsWith('generate') || 
-        args.toLowerCase().startsWith('draw') ||
-        args.toLowerCase().includes('image of');
-
-    // Workflow A: Image Generation via Imagen
-    if (isImageGenerationRequest) {
-        const imagePrompt = args.replace(/^(generate|draw)\s+/i, '').trim();
-        console.log(`[Imagen] Generating image for prompt: "${imagePrompt}"`);
-
-        try {
-            const imageResponse = await ai.models.generateImages({
-                model: 'imagen-3.0-generate-002',
-                prompt: imagePrompt,
-                config: {
-                    numberOfImages: 1,
-                    outputMimeType: 'image/jpeg',
-                    aspectRatio: '1:1',
-                },
-            });
-
-            const base64Image = imageResponse.generatedImages[0].image.imageBytes;
-            const imageBuffer = Buffer.from(base64Image, 'base64');
-
-            return {
-                image: imageBuffer,
-                caption: `🎨 *Generated for:* "${imagePrompt}"`
-            };
-        } catch (error) {
-            console.error('Image Generation Error:', error);
-            return { text: '❌ Failed to generate image.' };
-        }
-    }
-
-    // Workflow B: Multimodal Gemini Chat with Google Search Grounding
-    let contents = [];
+    const contents = [];
 
     if (quotedImageBuffer) {
         contents.push({
@@ -208,23 +170,191 @@ async function handleAI(args, msg, sock) {
     } else if (args) {
         textPrompt = args;
     } else {
-        textPrompt = 'Hello! How can you help me today?';
+        return { text: '⚠️ Please provide a prompt or reply to a message with `!ai`.' };
     }
 
     contents.push(textPrompt);
 
-    console.log(`[Gemini API] Sending prompt with Google Search enabled...`);
-    const response = await ai.models.generateContent({
-        model: 'gemini-3.6-flash',
-        contents: contents,
-        
-    });
+    // Show "typing..." status in WhatsApp chat
+    await sock.sendPresenceUpdate('composing', jid);
 
-    return { text: response.text || '🤖 Gemini generated an empty response.' };
+    let lastError = null;
+
+    try {
+        for (const modelName of AI_MODELS) {
+            try {
+                console.log(`[Gemini API] Trying model: ${modelName}`);
+                const response = await ai.models.generateContent({
+                    model: modelName,
+                    contents: contents,
+                });
+
+                return { text: response.text || '🤖 Gemini generated an empty response.' };
+            } catch (error) {
+                lastError = error;
+                const status = error?.status || '';
+                const msgText = error?.message || '';
+                const isRetryable =
+                    status === 429 ||
+                    status === 503 ||
+                    msgText.includes('429') ||
+                    msgText.includes('503') ||
+                    msgText.toLowerCase().includes('quota') ||
+                    msgText.toLowerCase().includes('overloaded');
+
+                if (isRetryable) {
+                    console.warn(`[Gemini API] ${modelName} hit limit/busy (${status}). Switching to next model...`);
+                    continue;
+                }
+                throw error; // Non-quota error (e.g., invalid API key), stop retrying
+            }
+        }
+
+        // If all models in the array failed
+        const errCode = lastError?.status || 'Unknown';
+        return { text: `❌ All AI models are currently busy or out of quota (Error: ${errCode}). Try again in a minute.` };
+    } finally {
+        // Clear typing indicator once finished or errored
+        await sock.sendPresenceUpdate('paused', jid);
+    }
 }
 
 // ==========================================
-// 2. COMMAND REGISTRY
+// 2. UNIFIED FREE GAMES MONITOR (STEAM & EPIC)
+// ==========================================
+
+const SENT_DEALS_FILE = './sent_deals.json';
+
+function getSentDeals() {
+    try {
+        if (fs.existsSync(SENT_DEALS_FILE)) {
+            return JSON.parse(fs.readFileSync(SENT_DEALS_FILE, 'utf8'));
+        }
+    } catch (e) {
+        console.error('Error reading sent_deals.json:', e);
+    }
+    return [];
+}
+
+function saveSentDeal(dealKey) {
+    const deals = getSentDeals();
+    if (!deals.includes(dealKey)) {
+        deals.push(dealKey);
+        fs.writeFileSync(SENT_DEALS_FILE, JSON.stringify(deals, null, 2));
+    }
+}
+
+async function checkFreeGames(sock) {
+    const targetJid = process.env.ALERT_TARGET_JID;
+    if (!targetJid) {
+        console.log('[Deals Monitor] ALERT_TARGET_JID not set in .env. Skipping check.');
+        return;
+    }
+
+    const sentDeals = getSentDeals();
+
+    // --- A. CHECK STEAM 100% OFF SPECIALS ---
+    try {
+        console.log('[Deals Monitor] Checking Steam for 100% free game promotions...');
+        const steamUrl = 'https://store.steampowered.com/search/results/?query&start=0&count=15&maxprice=free&category1=998&specials=1&json=1';
+        const steamRes = await fetch(steamUrl, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+        });
+
+        const steamData = await steamRes.json();
+        if (steamData?.results?.length > 0) {
+            for (const item of steamData.results) {
+                const dealKey = `steam_${item.id}`;
+                const isDiscounted = item.price?.discount_percent === 100;
+
+                if (isDiscounted && !sentDeals.includes(dealKey)) {
+                    console.log(`[Deals Monitor] New Steam freebie: ${item.name}`);
+                    const originalPrice = item.price?.original_formatted || 'Paid';
+                    const messageText = `🚨 *FREE STEAM GAME ALERT!* 🚨\n\n🎮 *${item.name}*\n🏷️ *Normal Price:* ~${originalPrice}~\n💸 *Now:* *100% FREE!*\n\n🔗 *Store Link:* ${item.url}`;
+
+                    if (item.logo) {
+                        await sock.sendMessage(targetJid, { image: { url: item.logo }, caption: messageText });
+                    } else {
+                        await sock.sendMessage(targetJid, { text: messageText });
+                    }
+
+                    saveSentDeal(dealKey);
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                }
+            }
+        }
+    } catch (error) {
+        console.error('[Deals Monitor] Error checking Steam deals:', error);
+    }
+
+    // --- B. CHECK EPIC GAMES STORE FREE PROMOTIONS ---
+    try {
+        console.log('[Deals Monitor] Checking Epic Games Store for free games...');
+        const epicUrl = 'https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions?locale=en-US&country=US&allowCountries=US';
+        const epicRes = await fetch(epicUrl, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+        });
+
+        const epicData = await epicRes.json();
+        const elements = epicData?.data?.Catalog?.searchStore?.elements || [];
+
+        for (const game of elements) {
+            // Check if there is an active promotional offer with 0% price (100% off)
+            const activeOffers = game.promotions?.promotionalOffers?.[0]?.promotionalOffers || [];
+            const isFreeNow = activeOffers.some(
+                offer => offer.discountSetting?.discountType === 'PERCENTAGE' && offer.discountSetting?.discountPercentage === 0
+            );
+
+            const dealKey = `epic_${game.id}`;
+
+            if (isFreeNow && !sentDeals.includes(dealKey)) {
+                console.log(`[Deals Monitor] New Epic Games freebie: ${game.title}`);
+
+                const slug = game.catalogNs?.mappings?.[0]?.pageSlug || game.productSlug || game.urlSlug;
+                const storeLink = slug
+                    ? `https://store.epicgames.com/en-US/p/${slug}`
+                    : 'https://store.epicgames.com/en-US/free-games';
+
+                const originalPrice = game.price?.totalPrice?.fmtPrice?.originalPrice || 'Paid';
+                const endDateRaw = activeOffers[0]?.endDate;
+                const endDateText = endDateRaw ? new Date(endDateRaw).toUTCString() : 'Limited Time';
+
+                // Grab cover/wide promotional image
+                const imageObj =
+                    game.keyImages?.find(img => img.type === 'OfferImageWide') ||
+                    game.keyImages?.find(img => img.type === 'DieselStoreFrontWide') ||
+                    game.keyImages?.[0];
+
+                const messageText = `🚨 *FREE EPIC GAMES ALERT!* 🚨\n\n🎮 *${game.title}*\n🏷️ *Normal Price:* ~${originalPrice}~\n💸 *Now:* *100% FREE!*\n⏳ *Ends:* ${endDateText}\n\n🔗 *Claim Here:* ${storeLink}`;
+
+                if (imageObj?.url) {
+                    await sock.sendMessage(targetJid, { image: { url: imageObj.url }, caption: messageText });
+                } else {
+                    await sock.sendMessage(targetJid, { text: messageText });
+                }
+
+                saveSentDeal(dealKey);
+                await new Promise(resolve => setTimeout(resolve, 3000));
+            }
+        }
+    } catch (error) {
+        console.error('[Deals Monitor] Error checking Epic Games deals:', error);
+    }
+}
+
+function startDealsMonitor(sock) {
+    checkFreeGames(sock);
+
+    const intervalHours = 3;
+    setInterval(() => {
+        checkFreeGames(sock);
+    }, intervalHours * 60 * 60 * 1000);
+
+    console.log(`[Deals Monitor] Steam & Epic Games checker active (every ${intervalHours} hours).`);
+}
+
+// ==========================================
+// 3. COMMAND REGISTRY & CONSOLE SENDER
 // ==========================================
 
 const commands = {
@@ -237,14 +367,44 @@ const commands = {
 
         if (type === 'game') return await searchIGDB(query);
         if (type === 'tv' || type === 'movie') return await searchTMDB(type, query);
-        return { text: `❌ Unknown type "${type}". Use game, tv, or movie.` };
+        return { text: `❌ Unknown type "${type}". Use \`game\`, \`tv\`, or \`movie\`.` };
     },
     '!ai': handleAI,
     '!ping': async () => ({ text: 'Pong! 🏓' }),
 };
 
+function setupConsoleSender(sock) {
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
+
+    console.log('\n💬 [Console Chat Ready] Type: send <number> <message>\n');
+
+    rl.on('line', async (line) => {
+        const parts = line.trim().split(' ');
+        const action = parts[0]?.toLowerCase();
+        const target = parts[1];
+        const messageText = parts.slice(2).join(' ');
+
+        if (action === 'send' && target && messageText) {
+            const cleanNumber = target.replace(/[^0-9]/g, '');
+            const jid = `${cleanNumber}@s.whatsapp.net`;
+
+            try {
+                await sock.sendMessage(jid, { text: messageText });
+                console.log(`✅ [Console] Sent message to ${jid}`);
+            } catch (error) {
+                console.error(`❌ [Console] Failed to send to ${jid}:`, error);
+            }
+        } else if (line.trim()) {
+            console.log('⚠️ Invalid format. Use: send <number> <message>');
+        }
+    });
+}
+
 // ==========================================
-// 3. WHATSAPP SOCKET & ROUTER
+// 4. WHATSAPP SOCKET & ROUTER
 // ==========================================
 
 async function connectToWhatsApp() {
@@ -268,6 +428,8 @@ async function connectToWhatsApp() {
             if (statusCode !== DisconnectReason.loggedOut) connectToWhatsApp();
         } else if (connection === 'open') {
             console.log('✅ Bot successfully connected to WhatsApp!');
+            setupConsoleSender(sock);
+            startDealsMonitor(sock);
         }
     });
 
@@ -296,12 +458,12 @@ async function connectToWhatsApp() {
             try {
                 console.log(`[CMD] ${trigger} | From: ${jid}`);
                 const result = await handler(args, msg, sock);
-                
+
                 if (result) {
                     if (typeof result === 'object' && result.image) {
-                        await sock.sendMessage(jid, { 
-                            image: result.image, 
-                            caption: result.caption || result.text || '' 
+                        await sock.sendMessage(jid, {
+                            image: result.image,
+                            caption: result.caption || result.text || ''
                         }, { quoted: msg });
                     } else {
                         const textReply = typeof result === 'string' ? result : result.text;
