@@ -21,7 +21,6 @@ const AI_MODELS = [
 // 1. SEARCH & RANKING HELPERS (IGDB, TMDB, GEMINI)
 // ==========================================
 
-// Extracts a trailing 4-digit year if present (e.g., "daredevil 2025" -> { cleanQuery: "daredevil", year: 2025 })
 function parseQueryAndYear(rawQuery) {
     const match = rawQuery.match(/^(.*?)(?:\s+\(?((?:19|20)\d{2})\)?)$/);
     if (match && match[1].trim().length > 0) {
@@ -52,7 +51,6 @@ async function searchIGDB(rawQuery) {
     try {
         const { cleanQuery, year } = parseQueryAndYear(rawQuery);
         const safeQuery = cleanQuery.replace(/"/g, '\\"');
-        console.log(`[IGDB API] Querying games for: "${cleanQuery}"${year ? ` (Year: ${year})` : ''}`);
 
         const igdbRes = await fetch('https://api.igdb.com/v4/games', {
             method: 'POST',
@@ -71,7 +69,6 @@ async function searchIGDB(rawQuery) {
 
         const normQuery = normalizeTitle(cleanQuery);
 
-        // Score and rank candidates so main titles & popular games beat DLCs/fangames
         const ranked = rawData
             .map((g) => {
                 const normName = normalizeTitle(g.name);
@@ -79,24 +76,19 @@ async function searchIGDB(rawQuery) {
                 const typeCode = g.game_type ?? g.category ?? 0;
 
                 let score = 0;
-
-                // 1. Title similarity
                 if (normName === normQuery) score += 1000;
                 else if (normName.startsWith(normQuery + ' ')) score += 450;
                 else if (normName.includes(normQuery)) score += 200;
 
-                // 2. Game type weight (0 = Main Game, 8 = Remake, 9 = Remaster)
                 if (typeCode === 0) score += 300;
                 else if (typeCode === 8 || typeCode === 9) score += 220;
-                else if (typeCode === 4) score += 150; // Standalone expansion
-                else score -= 150; // DLC, bundle, mod, episode
+                else if (typeCode === 4) score += 150;
+                else score -= 150;
 
-                // 3. Popularity & rating count
                 const ratingCount = g.total_rating_count || 0;
                 const hypes = g.hypes || 0;
                 score += Math.min(ratingCount, 2000) * 0.6 + Math.min(hypes, 500) * 0.3;
 
-                // 4. Optional year filter boost
                 if (year && gameYear === year) score += 1500;
 
                 return { ...g, _score: score, _year: gameYear };
@@ -104,9 +96,7 @@ async function searchIGDB(rawQuery) {
             .sort((a, b) => b._score - a._score);
 
         const game = ranked[0];
-        const runnersUp = ranked
-            .slice(1, 3)
-            .map((g) => `${g.name}${g._year ? ` (${g._year})` : ''}`);
+        const runnersUp = ranked.slice(1, 3).map((g) => `${g.name}${g._year ? ` (${g._year})` : ''}`);
 
         const releaseYear = game._year || 'Unknown';
         const rating = game.total_rating ? Math.round(game.total_rating) + '/100' : 'N/A';
@@ -128,6 +118,95 @@ async function searchIGDB(rawQuery) {
     }
 }
 
+// ==========================================
+// NEW: IGDB LIST & PAGINATION HANDLER
+// ==========================================
+async function listIGDBGames(subArg) {
+    const clientId = process.env.TWITCH_CLIENT_ID;
+    const accessToken = process.env.IGDB_ACCESS_TOKEN;
+
+    if (!clientId || !accessToken) {
+        return '⚠️ IGDB credentials are missing in your .env file.';
+    }
+
+    // Parse command: popular [page], new [page], or <query> [limit]
+    let mode = 'search';
+    let queryTerm = '';
+    let page = 1;
+    let limit = 10;
+
+    const parts = subArg.split(' ');
+    const firstToken = parts[0]?.toLowerCase();
+
+    if (firstToken === 'popular' || firstToken === 'new') {
+        mode = firstToken;
+        if (parts[1] && !isNaN(parts[1])) {
+            page = parseInt(parts[1], 10);
+        }
+    } else {
+        // Check if last token is a number specifying result count (e.g. "cyberpunk 5")
+        const lastToken = parts[parts.length - 1];
+        if (parts.length > 1 && !isNaN(lastToken)) {
+            limit = Math.min(parseInt(lastToken, 10), 15); // max 15 per list
+            queryTerm = parts.slice(0, -1).join(' ');
+        } else {
+            queryTerm = subArg;
+        }
+    }
+
+    const currentTimeSec = Math.floor(Date.now() / 1000);
+    let apicalypseBody = '';
+
+    if (mode === 'popular') {
+        // Popular games based on rating count & hypes
+        const offset = (page - 1) * 10;
+        apicalypseBody = `fields name, total_rating, total_rating_count, first_release_date, id; where version_parent = null & total_rating_count != null; sort total_rating_count desc; limit 10; offset ${offset};`;
+    } else if (mode === 'new') {
+        // Newest games released up to now
+        const offset = (page - 1) * 10;
+        apicalypseBody = `fields name, total_rating, first_release_date, id; where version_parent = null & first_release_date != null & first_release_date <= ${currentTimeSec}; sort first_release_date desc; limit 10; offset ${offset};`;
+    } else {
+        // Keyword Search list
+        const safeQuery = queryTerm.replace(/"/g, '\\"');
+        apicalypseBody = `search "${safeQuery}"; fields name, total_rating, first_release_date, id; where version_parent = null; limit ${limit};`;
+    }
+
+    try {
+        const endpoint = (mode === 'search') ? 'search' : 'games';
+        const igdbRes = await fetch(`https://api.igdb.com/v4/${endpoint}`, {
+            method: 'POST',
+            headers: {
+                'Client-ID': clientId,
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'text/plain',
+            },
+            body: apicalypseBody
+        });
+
+        const rawData = await igdbRes.json();
+        if (!Array.isArray(rawData) || rawData.length === 0) {
+            return `❌ No games found for query "${subArg}".`;
+        }
+
+        let titleHeader = `🎮 *Sharkny Game List* (${mode.toUpperCase()}${page > 1 ? ` - Page ${page}` : ''}):\n\n`;
+        if (mode === 'search') {
+            titleHeader = `🎮 *Search Results for "${queryTerm}"*:\n\n`;
+        }
+
+        const listItems = rawData.map((g, index) => {
+            const year = g.first_release_date ? new Date(g.first_release_date * 1000).getFullYear() : 'N/A';
+            const rating = g.total_rating ? `⭐ ${Math.round(g.total_rating)}/100` : '';
+            const link = `https://sharkny-three.vercel.app/game/${g.id}`;
+            return `*${index + 1}.* *${g.name}* (${year}) ${rating}\n🔗 ${link}`;
+        });
+
+        return titleHeader + listItems.join('\n\n');
+    } catch (error) {
+        console.error('IGDB List Error:', error);
+        return '❌ Failed to fetch game list from IGDB.';
+    }
+}
+
 async function searchTMDB(mediaType, rawQuery) {
     const tmdbToken = process.env.TMDB_ACCESS_TOKEN;
     if (!tmdbToken) {
@@ -137,7 +216,6 @@ async function searchTMDB(mediaType, rawQuery) {
     try {
         const endpoint = mediaType === 'tv' ? 'tv' : 'movie';
         const { cleanQuery, year } = parseQueryAndYear(rawQuery);
-        console.log(`[TMDB API] Searching ${endpoint} for: "${cleanQuery}"${year ? ` (Year: ${year})` : ''}`);
 
         let searchUrl = `https://api.themoviedb.org/3/search/${endpoint}?query=${encodeURIComponent(cleanQuery)}&include_adult=false&language=en-US&page=1`;
         if (year) {
@@ -154,31 +232,20 @@ async function searchTMDB(mediaType, rawQuery) {
         }
 
         const normQuery = normalizeTitle(cleanQuery);
-
-        // Score top 15 results so exact title + established vote_count beats trending spin-offs
         const ranked = searchData.results
             .slice(0, 15)
             .map((entry) => {
                 const entryTitle = entry.title || entry.name || '';
-                const origTitle = entry.original_title || entry.original_name || '';
                 const normTitle = normalizeTitle(entryTitle);
-                const normOrig = normalizeTitle(origTitle);
                 const rawDate = entry.release_date || entry.first_air_date;
                 const entryYear = rawDate ? new Date(rawDate).getFullYear() : null;
 
                 let score = 0;
-
-                // 1. Exact vs prefix title match
-                if (normTitle === normQuery || normOrig === normQuery) score += 1000;
+                if (normTitle === normQuery) score += 1000;
                 else if (normTitle.startsWith(normQuery + ' ')) score += 300;
                 else if (normTitle.includes(normQuery)) score += 100;
 
-                // 2. Vote count & popularity balance
-                const voteCount = entry.vote_count || 0;
-                const popularity = entry.popularity || 0;
-                score += Math.min(voteCount, 10000) * 0.25 + Math.min(popularity, 500) * 0.5;
-
-                // 3. Year match bonus
+                score += Math.min(entry.vote_count || 0, 10000) * 0.25 + Math.min(entry.popularity || 0, 500) * 0.5;
                 if (year && entryYear === year) score += 1500;
 
                 return { ...entry, _score: score, _year: entryYear };
@@ -186,9 +253,7 @@ async function searchTMDB(mediaType, rawQuery) {
             .sort((a, b) => b._score - a._score);
 
         const bestMatch = ranked[0];
-        const runnersUp = ranked
-            .slice(1, 3)
-            .map((r) => `${r.title || r.name}${r._year ? ` (${r._year})` : ''}`);
+        const runnersUp = ranked.slice(1, 3).map((r) => `${r.title || r.name}${r._year ? ` (${r._year})` : ''}`);
 
         const detailsRes = await fetch(`https://api.themoviedb.org/3/${endpoint}/${bestMatch.id}`, {
             headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' }
@@ -234,87 +299,45 @@ async function handleAI(args, msg, sock) {
     let quotedImageBuffer = null;
 
     if (quotedMessage) {
-        quotedText =
-            quotedMessage.conversation ||
-            quotedMessage.extendedTextMessage?.text ||
-            quotedMessage.imageMessage?.caption ||
-            '';
-
+        quotedText = quotedMessage.conversation || quotedMessage.extendedTextMessage?.text || quotedMessage.imageMessage?.caption || '';
         if (quotedMessage.imageMessage) {
             try {
-                console.log('[Gemini API] Downloading quoted image...');
-                quotedImageBuffer = await downloadMediaMessage(
-                    { message: quotedMessage },
-                    'buffer',
-                    {},
-                    { logger: pino({ level: 'silent' }) }
-                );
+                quotedImageBuffer = await downloadMediaMessage({ message: quotedMessage }, 'buffer', {}, { logger: pino({ level: 'silent' }) });
             } catch (err) {
-                console.error('Failed to download image from quoted message:', err);
+                console.error('Failed to download image:', err);
             }
         }
     }
 
     const contents = [];
-
     if (quotedImageBuffer) {
-        contents.push({
-            inlineData: {
-                data: quotedImageBuffer.toString('base64'),
-                mimeType: 'image/jpeg'
-            }
-        });
+        contents.push({ inlineData: { data: quotedImageBuffer.toString('base64'), mimeType: 'image/jpeg' } });
     }
 
     let textPrompt = '';
-    if (quotedText && args) {
-        textPrompt = `${args}\n\nContext:\n"""\n${quotedText}\n"""`;
-    } else if (quotedText && !args) {
-        textPrompt = `Analyze or respond to this message/content:\n"""\n${quotedText}\n"""`;
-    } else if (args) {
-        textPrompt = args;
-    } else {
-        return { text: '⚠️ Please provide a prompt or reply to a message with `!ai`.' };
-    }
+    if (quotedText && args) textPrompt = `${args}\n\nContext:\n"""\n${quotedText}\n"""`;
+    else if (quotedText && !args) textPrompt = `Analyze or respond to this message/content:\n"""\n${quotedText}\n"""`;
+    else if (args) textPrompt = args;
+    else return { text: '⚠️ Please provide a prompt or reply to a message with `!ai`.' };
 
     contents.push(textPrompt);
-
     await sock.sendPresenceUpdate('composing', jid);
 
     let lastError = null;
-
     try {
         for (const modelName of AI_MODELS) {
             try {
-                console.log(`[Gemini API] Trying model: ${modelName}`);
-                const response = await ai.models.generateContent({
-                    model: modelName,
-                    contents: contents,
-                });
-
+                const response = await ai.models.generateContent({ model: modelName, contents: contents });
                 return { text: response.text || '🤖 Gemini generated an empty response.' };
             } catch (error) {
                 lastError = error;
                 const status = error?.status || '';
                 const msgText = error?.message || '';
-                const isRetryable =
-                    status === 429 ||
-                    status === 503 ||
-                    msgText.includes('429') ||
-                    msgText.includes('503') ||
-                    msgText.toLowerCase().includes('quota') ||
-                    msgText.toLowerCase().includes('overloaded');
-
-                if (isRetryable) {
-                    console.warn(`[Gemini API] ${modelName} hit limit/busy (${status}). Switching to next model...`);
-                    continue;
-                }
+                if (status === 429 || status === 503 || msgText.includes('429') || msgText.includes('503')) continue;
                 throw error;
             }
         }
-
-        const errCode = lastError?.status || 'Unknown';
-        return { text: `❌ All AI models are currently busy or out of quota (Error: ${errCode}). Try again in a minute.` };
+        return { text: `❌ All AI models are currently busy or out of quota. Try again in a minute.` };
     } finally {
         await sock.sendPresenceUpdate('paused', jid);
     }
@@ -328,12 +351,8 @@ const SENT_DEALS_FILE = './sent_deals.json';
 
 function getSentDeals() {
     try {
-        if (fs.existsSync(SENT_DEALS_FILE)) {
-            return JSON.parse(fs.readFileSync(SENT_DEALS_FILE, 'utf8'));
-        }
-    } catch (e) {
-        console.error('Error reading sent_deals.json:', e);
-    }
+        if (fs.existsSync(SENT_DEALS_FILE)) return JSON.parse(fs.readFileSync(SENT_DEALS_FILE, 'utf8'));
+    } catch (e) {}
     return [];
 }
 
@@ -347,70 +366,37 @@ function saveSentDeal(dealKey) {
 
 async function fetchActiveDeals() {
     let dealsList = [];
-
-    // --- A. FETCH STEAM FREE SPECIALS ---
     try {
-        const steamUrl = 'https://store.steampowered.com/search/results/?query&start=0&count=15&maxprice=free&category1=998&specials=1&json=1';
-        const steamRes = await fetch(steamUrl, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+        const steamRes = await fetch('https://store.steampowered.com/search/results/?query&start=0&count=15&maxprice=free&category1=998&specials=1&json=1', {
+            headers: { 'User-Agent': 'Mozilla/5.0' }
         });
         const steamData = await steamRes.json();
-
-        if (steamData?.results?.length > 0) {
+        if (steamData?.results) {
             for (const item of steamData.results) {
                 if (item.price?.discount_percent === 100) {
-                    dealsList.push({
-                        id: `steam_${item.id}`,
-                        title: item.name,
-                        store: 'Steam',
-                        originalPrice: item.price?.original_formatted || 'Paid',
-                        link: item.url,
-                        image: item.logo || null
-                    });
+                    dealsList.push({ id: `steam_${item.id}`, title: item.name, store: 'Steam', originalPrice: item.price?.original_formatted || 'Paid', link: item.url, image: item.logo || null });
                 }
             }
         }
-    } catch (error) {
-        console.error('[Deals Fetcher] Error fetching Steam deals:', error);
-    }
+    } catch (e) {}
 
-    // --- B. FETCH EPIC GAMES STORE FREEBIES ---
     try {
-        const epicUrl = 'https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions?locale=en-US&country=US&allowCountries=US';
-        const epicRes = await fetch(epicUrl, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+        const epicRes = await fetch('https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions?locale=en-US&country=US&allowCountries=US', {
+            headers: { 'User-Agent': 'Mozilla/5.0' }
         });
         const epicData = await epicRes.json();
         const elements = epicData?.data?.Catalog?.searchStore?.elements || [];
-
         for (const game of elements) {
             const activeOffers = game.promotions?.promotionalOffers?.[0]?.promotionalOffers || [];
-            const isFreeNow = activeOffers.some(
-                offer => offer.discountSetting?.discountType === 'PERCENTAGE' && offer.discountSetting?.discountPercentage === 0
-            );
-
+            const isFreeNow = activeOffers.some(o => o.discountSetting?.discountPercentage === 0);
             if (isFreeNow) {
                 const slug = game.catalogNs?.mappings?.[0]?.pageSlug || game.productSlug || game.urlSlug;
                 const storeLink = slug ? `https://store.epicgames.com/en-US/p/${slug}` : 'https://store.epicgames.com/en-US/free-games';
-                const originalPrice = game.price?.totalPrice?.fmtPrice?.originalPrice || 'Paid';
-                const imageObj =
-                    game.keyImages?.find(img => img.type === 'OfferImageWide') ||
-                    game.keyImages?.find(img => img.type === 'DieselStoreFrontWide') ||
-                    game.keyImages?.[0];
-
-                dealsList.push({
-                    id: `epic_${game.id}`,
-                    title: game.title,
-                    store: 'Epic Games Store',
-                    originalPrice: originalPrice,
-                    link: storeLink,
-                    image: imageObj?.url || null
-                });
+                const imageObj = game.keyImages?.find(img => img.type === 'OfferImageWide') || game.keyImages?.[0];
+                dealsList.push({ id: `epic_${game.id}`, title: game.title, store: 'Epic Games Store', originalPrice: game.price?.totalPrice?.fmtPrice?.originalPrice || 'Paid', link: storeLink, image: imageObj?.url || null });
             }
         }
-    } catch (error) {
-        console.error('[Deals Fetcher] Error fetching Epic Games deals:', error);
-    }
+    } catch (e) {}
 
     return dealsList;
 }
@@ -418,34 +404,26 @@ async function fetchActiveDeals() {
 async function checkFreeGames(sock) {
     const targetJid = process.env.ALERT_TARGET_JID;
     if (!targetJid) return;
-
     const sentDeals = getSentDeals();
     const activeDeals = await fetchActiveDeals();
 
     for (const deal of activeDeals) {
         if (!sentDeals.includes(deal.id)) {
-            console.log(`[Deals Monitor] New freebie found: ${deal.title} (${deal.store})`);
             const messageText = `🚨 *FREE ${deal.store.toUpperCase()} ALERT!* 🚨\n\n🎮 *${deal.title}*\n🏷️ *Normal Price:* ~${deal.originalPrice}~\n💸 *Now:* *100% FREE!*\n\n🔗 *Store Link:* ${deal.link}`;
-
             if (deal.image) {
                 await sock.sendMessage(targetJid, { image: { url: deal.image }, caption: messageText });
             } else {
                 await sock.sendMessage(targetJid, { text: messageText });
             }
-
             saveSentDeal(deal.id);
-            await new Promise(resolve => setTimeout(resolve, 3000));
+            await new Promise(r => setTimeout(r, 3000));
         }
     }
 }
 
 function startDealsMonitor(sock) {
     checkFreeGames(sock);
-    const intervalHours = 3;
-    setInterval(() => {
-        checkFreeGames(sock);
-    }, intervalHours * 60 * 60 * 1000);
-    console.log(`[Deals Monitor] Steam & Epic Games background checker active.`);
+    setInterval(() => checkFreeGames(sock), 3 * 60 * 60 * 1000);
 }
 
 // ==========================================
@@ -453,70 +431,73 @@ function startDealsMonitor(sock) {
 // ==========================================
 
 const commands = {
-    '!sharkny': async (args) => {
-        if (!args) return { text: '⚠️ Usage: `!sharkny <game|tv|movie> <query> [year]`' };
+    '!sharkny': async (args, msg, sock) => {
+        if (!args) return { text: '⚠️ Usage:\n• `!sharkny game <query>`\n• `!sharkny tv <query>`\n• `!sharkny movie <query>`\n• `!sharkny list game <popular|new|query> [page/limit]`' };
+        
         const firstSpace = args.indexOf(' ');
-        if (firstSpace === -1) return { text: '⚠️ Please include a search query.' };
-        const type = args.slice(0, firstSpace).toLowerCase();
-        const query = args.slice(firstSpace + 1).trim();
+        if (firstSpace === -1) return { text: '⚠️ Invalid format.' };
 
-        if (type === 'game') return await searchIGDB(query);
-        if (type === 'tv' || type === 'movie') return await searchTMDB(type, query);
-        return { text: `❌ Unknown type "${type}". Use \`game\`, \`tv\`, or \`movie\`.` };
+        const modeOrType = args.slice(0, firstSpace).toLowerCase();
+        const rest = args.slice(firstSpace + 1).trim();
+
+        // Handle list command: !sharkny list game ...
+        if (modeOrType === 'list') {
+            const secondSpace = rest.indexOf(' ');
+            const category = secondSpace === -1 ? rest.toLowerCase() : rest.slice(0, secondSpace).toLowerCase();
+            const subArg = secondSpace === -1 ? '' : rest.slice(secondSpace + 1).trim();
+
+            if (category === 'game') {
+                const listResultText = await listIGDBGames(subArg);
+                return { text: listResultText };
+            } else {
+                return { text: `❌ Unknown list category "${category}". Currently supported: \`!sharkny list game ...\`` };
+            }
+        }
+
+        // Handle standard single search: !sharkny game/tv/movie <query>
+        const query = rest;
+        if (modeOrType === 'game') return await searchIGDB(query);
+        if (modeOrType === 'tv' || modeOrType === 'movie') return await searchTMDB(modeOrType, query);
+        
+        return { text: `❌ Unknown subcommand "${modeOrType}". Use \`game\`, \`tv\`, \`movie\`, or \`list game\`.` };
     },
     '!ai': handleAI,
     '!ping': async () => ({ text: 'Pong! 🏓' }),
     '!deals': async (args, msg, sock) => {
         const jid = msg.key.remoteJid;
         await sock.sendMessage(jid, { text: '🔍 Scanning Steam and Epic Games for currently active 100% free deals...' });
-
         const deals = await fetchActiveDeals();
+        if (deals.length === 0) return { text: 'ℹ️ There are currently no active 100% free game promotions.' };
 
-        if (deals.length === 0) {
-            return { text: 'ℹ️ There are currently no active 100% free game promotions running on Steam or Epic Games.' };
-        }
-
-        await sock.sendMessage(jid, { text: `🎯 Found *${deals.length}* active free game deal(s) right now:` });
-
+        await sock.sendMessage(jid, { text: `🎯 Found *${deals.length}* active free game deal(s):` });
         for (const deal of deals) {
             const cardText = `🎮 *${deal.title}* (${deal.store})\n🏷️ *Normal Price:* ~${deal.originalPrice}~\n💸 *Price:* *100% FREE*\n\n🔗 *Store Link:* ${deal.link}`;
-
             if (deal.image) {
                 await sock.sendMessage(jid, { image: { url: deal.image }, caption: cardText });
             } else {
                 await sock.sendMessage(jid, { text: cardText });
             }
-            await new Promise(resolve => setTimeout(resolve, 1500));
+            await new Promise(r => setTimeout(r, 1500));
         }
     }
 };
 
 function setupConsoleSender(sock) {
-    const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout
-    });
-
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     console.log('\n💬 [Console Chat Ready] Type: send <number> <message>\n');
-
     rl.on('line', async (line) => {
         const parts = line.trim().split(' ');
         const action = parts[0]?.toLowerCase();
         const target = parts[1];
         const messageText = parts.slice(2).join(' ');
-
         if (action === 'send' && target && messageText) {
-            const cleanNumber = target.replace(/[^0-9]/g, '');
-            const jid = `${cleanNumber}@s.whatsapp.net`;
-
+            const jid = `${target.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
             try {
                 await sock.sendMessage(jid, { text: messageText });
                 console.log(`✅ [Console] Sent message to ${jid}`);
             } catch (error) {
-                console.error(`❌ [Console] Failed to send to ${jid}:`, error);
+                console.error(`❌ Failed:`, error);
             }
-        } else if (line.trim()) {
-            console.log('⚠️ Invalid format. Use: send <number> <message>');
         }
     });
 }
@@ -527,23 +508,14 @@ function setupConsoleSender(sock) {
 
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-
-    const sock = makeWASocket({
-        auth: state,
-        logger: pino({ level: 'silent' }),
-    });
+    const sock = makeWASocket({ auth: state, logger: pino({ level: 'silent' }) });
 
     sock.ev.on('creds.update', saveCreds);
-
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
-        if (qr) {
-            console.log('Scan the QR code below to connect:');
-            qrcode.generate(qr, { small: true });
-        }
+        if (qr) qrcode.generate(qr, { small: true });
         if (connection === 'close') {
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            if (statusCode !== DisconnectReason.loggedOut) connectToWhatsApp();
+            if (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut) connectToWhatsApp();
         } else if (connection === 'open') {
             console.log('✅ Bot successfully connected to WhatsApp!');
             setupConsoleSender(sock);
@@ -553,17 +525,10 @@ async function connectToWhatsApp() {
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
-
         for (const msg of messages) {
             if (msg.key.fromMe || !msg.message) continue;
-
             const jid = msg.key.remoteJid;
-            const textBody = (
-                msg.message.conversation ||
-                msg.message.extendedTextMessage?.text ||
-                ''
-            ).trim();
-
+            const textBody = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim();
             if (!textBody) continue;
 
             const spaceIndex = textBody.indexOf(' ');
@@ -576,16 +541,11 @@ async function connectToWhatsApp() {
             try {
                 console.log(`[CMD] ${trigger} | From: ${jid}`);
                 const result = await handler(args, msg, sock);
-
                 if (result) {
                     if (typeof result === 'object' && result.image) {
-                        await sock.sendMessage(jid, {
-                            image: result.image,
-                            caption: result.caption || result.text || ''
-                        }, { quoted: msg });
+                        await sock.sendMessage(jid, { image: result.image, caption: result.caption || result.text || '' }, { quoted: msg });
                     } else {
-                        const textReply = typeof result === 'string' ? result : result.text;
-                        await sock.sendMessage(jid, { text: textReply }, { quoted: msg });
+                        await sock.sendMessage(jid, { text: typeof result === 'string' ? result : result.text }, { quoted: msg });
                     }
                 }
             } catch (error) {
