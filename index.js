@@ -109,7 +109,7 @@ async function searchTMDB(mediaType, query) {
         }
 
         const typeEmoji = mediaType === 'tv' ? '📺' : '🎬';
-        const sharknyLink = `\n\n🔗 *View on Sharkny:* https://sharkny-three.vercel.app/tv/${item.id}`;
+        const sharknyLink = `\n\n🔗 *View on Sharkny:* https://sharkny-three.vercel.app/${endpoint}/${item.id}`;
         const captionText = `${typeEmoji} *${title}* (${releaseYear})\n\n⭐ *Rating:* ${rating}${extraStats}\n\n📝 *Overview:* ${overview}${sharknyLink}`;
 
         const imageUrl = item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null;
@@ -175,7 +175,6 @@ async function handleAI(args, msg, sock) {
 
     contents.push(textPrompt);
 
-    // Show "typing..." status in WhatsApp chat
     await sock.sendPresenceUpdate('composing', jid);
 
     let lastError = null;
@@ -206,21 +205,19 @@ async function handleAI(args, msg, sock) {
                     console.warn(`[Gemini API] ${modelName} hit limit/busy (${status}). Switching to next model...`);
                     continue;
                 }
-                throw error; // Non-quota error (e.g., invalid API key), stop retrying
+                throw error;
             }
         }
 
-        // If all models in the array failed
         const errCode = lastError?.status || 'Unknown';
         return { text: `❌ All AI models are currently busy or out of quota (Error: ${errCode}). Try again in a minute.` };
     } finally {
-        // Clear typing indicator once finished or errored
         await sock.sendPresenceUpdate('paused', jid);
     }
 }
 
 // ==========================================
-// 2. UNIFIED FREE GAMES MONITOR (STEAM & EPIC)
+// 2. FREE GAMES FETCHER & DEALS MONITOR
 // ==========================================
 
 const SENT_DEALS_FILE = './sent_deals.json';
@@ -244,113 +241,109 @@ function saveSentDeal(dealKey) {
     }
 }
 
-async function checkFreeGames(sock) {
-    const targetJid = process.env.ALERT_TARGET_JID;
-    if (!targetJid) {
-        console.log('[Deals Monitor] ALERT_TARGET_JID not set in .env. Skipping check.');
-        return;
-    }
+// Core fetcher function used by both background monitoring and the !deals command
+async function fetchActiveDeals() {
+    let dealsList = [];
 
-    const sentDeals = getSentDeals();
-
-    // --- A. CHECK STEAM 100% OFF SPECIALS ---
+    // --- A. FETCH STEAM FREE SPECIALS ---
     try {
-        console.log('[Deals Monitor] Checking Steam for 100% free game promotions...');
         const steamUrl = 'https://store.steampowered.com/search/results/?query&start=0&count=15&maxprice=free&category1=998&specials=1&json=1';
         const steamRes = await fetch(steamUrl, {
             headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
         });
-
         const steamData = await steamRes.json();
+
         if (steamData?.results?.length > 0) {
             for (const item of steamData.results) {
-                const dealKey = `steam_${item.id}`;
-                const isDiscounted = item.price?.discount_percent === 100;
-
-                if (isDiscounted && !sentDeals.includes(dealKey)) {
-                    console.log(`[Deals Monitor] New Steam freebie: ${item.name}`);
-                    const originalPrice = item.price?.original_formatted || 'Paid';
-                    const messageText = `🚨 *FREE STEAM GAME ALERT!* 🚨\n\n🎮 *${item.name}*\n🏷️ *Normal Price:* ~${originalPrice}~\n💸 *Now:* *100% FREE!*\n\n🔗 *Store Link:* ${item.url}`;
-
-                    if (item.logo) {
-                        await sock.sendMessage(targetJid, { image: { url: item.logo }, caption: messageText });
-                    } else {
-                        await sock.sendMessage(targetJid, { text: messageText });
-                    }
-
-                    saveSentDeal(dealKey);
-                    await new Promise(resolve => setTimeout(resolve, 3000));
+                if (item.price?.discount_percent === 100) {
+                    dealsList.push({
+                        id: `steam_${item.id}`,
+                        title: item.name,
+                        store: 'Steam',
+                        originalPrice: item.price?.original_formatted || 'Paid',
+                        link: item.url,
+                        image: item.logo || null
+                    });
                 }
             }
         }
     } catch (error) {
-        console.error('[Deals Monitor] Error checking Steam deals:', error);
+        console.error('[Deals Fetcher] Error fetching Steam deals:', error);
     }
 
-    // --- B. CHECK EPIC GAMES STORE FREE PROMOTIONS ---
+    // --- B. FETCH EPIC GAMES STORE FREEBIES ---
     try {
-        console.log('[Deals Monitor] Checking Epic Games Store for free games...');
         const epicUrl = 'https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions?locale=en-US&country=US&allowCountries=US';
         const epicRes = await fetch(epicUrl, {
             headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
         });
-
         const epicData = await epicRes.json();
         const elements = epicData?.data?.Catalog?.searchStore?.elements || [];
 
         for (const game of elements) {
-            // Check if there is an active promotional offer with 0% price (100% off)
             const activeOffers = game.promotions?.promotionalOffers?.[0]?.promotionalOffers || [];
             const isFreeNow = activeOffers.some(
                 offer => offer.discountSetting?.discountType === 'PERCENTAGE' && offer.discountSetting?.discountPercentage === 0
             );
 
-            const dealKey = `epic_${game.id}`;
-
-            if (isFreeNow && !sentDeals.includes(dealKey)) {
-                console.log(`[Deals Monitor] New Epic Games freebie: ${game.title}`);
-
+            if (isFreeNow) {
                 const slug = game.catalogNs?.mappings?.[0]?.pageSlug || game.productSlug || game.urlSlug;
-                const storeLink = slug
-                    ? `https://store.epicgames.com/en-US/p/${slug}`
-                    : 'https://store.epicgames.com/en-US/free-games';
-
+                const storeLink = slug ? `https://store.epicgames.com/en-US/p/${slug}` : 'https://store.epicgames.com/en-US/free-games';
                 const originalPrice = game.price?.totalPrice?.fmtPrice?.originalPrice || 'Paid';
-                const endDateRaw = activeOffers[0]?.endDate;
-                const endDateText = endDateRaw ? new Date(endDateRaw).toUTCString() : 'Limited Time';
-
-                // Grab cover/wide promotional image
                 const imageObj =
                     game.keyImages?.find(img => img.type === 'OfferImageWide') ||
                     game.keyImages?.find(img => img.type === 'DieselStoreFrontWide') ||
                     game.keyImages?.[0];
 
-                const messageText = `🚨 *FREE EPIC GAMES ALERT!* 🚨\n\n🎮 *${game.title}*\n🏷️ *Normal Price:* ~${originalPrice}~\n💸 *Now:* *100% FREE!*\n⏳ *Ends:* ${endDateText}\n\n🔗 *Claim Here:* ${storeLink}`;
-
-                if (imageObj?.url) {
-                    await sock.sendMessage(targetJid, { image: { url: imageObj.url }, caption: messageText });
-                } else {
-                    await sock.sendMessage(targetJid, { text: messageText });
-                }
-
-                saveSentDeal(dealKey);
-                await new Promise(resolve => setTimeout(resolve, 3000));
+                dealsList.push({
+                    id: `epic_${game.id}`,
+                    title: game.title,
+                    store: 'Epic Games Store',
+                    originalPrice: originalPrice,
+                    link: storeLink,
+                    image: imageObj?.url || null
+                });
             }
         }
     } catch (error) {
-        console.error('[Deals Monitor] Error checking Epic Games deals:', error);
+        console.error('[Deals Fetcher] Error fetching Epic Games deals:', error);
+    }
+
+    return dealsList;
+}
+
+// Background Automated Monitor (checks every 3 hours and alerts ALERT_TARGET_JID)
+async function checkFreeGames(sock) {
+    const targetJid = process.env.ALERT_TARGET_JID;
+    if (!targetJid) return;
+
+    const sentDeals = getSentDeals();
+    const activeDeals = await fetchActiveDeals();
+
+    for (const deal of activeDeals) {
+        if (!sentDeals.includes(deal.id)) {
+            console.log(`[Deals Monitor] New freebie found: ${deal.title} (${deal.store})`);
+            const messageText = `🚨 *FREE ${deal.store.toUpperCase()} ALERT!* 🚨\n\n🎮 *${deal.title}*\n🏷️ *Normal Price:* ~${deal.originalPrice}~\n💸 *Now:* *100% FREE!*\n\n🔗 *Store Link:* ${deal.link}`;
+
+            if (deal.image) {
+                await sock.sendMessage(targetJid, { image: { url: deal.image }, caption: messageText });
+            } else {
+                await sock.sendMessage(targetJid, { text: messageText });
+            }
+
+            saveSentDeal(deal.id);
+            await new Promise(resolve => setTimeout(resolve, 3000));
+        }
     }
 }
 
 function startDealsMonitor(sock) {
     checkFreeGames(sock);
-
     const intervalHours = 3;
     setInterval(() => {
         checkFreeGames(sock);
     }, intervalHours * 60 * 60 * 1000);
-
-    console.log(`[Deals Monitor] Steam & Epic Games checker active (every ${intervalHours} hours).`);
+    console.log(`[Deals Monitor] Steam & Epic Games background checker active.`);
 }
 
 // ==========================================
@@ -371,6 +364,31 @@ const commands = {
     },
     '!ai': handleAI,
     '!ping': async () => ({ text: 'Pong! 🏓' }),
+    '!deals': async (args, msg, sock) => {
+        const jid = msg.key.remoteJid;
+        await sock.sendMessage(jid, { text: '🔍 Scanning Steam and Epic Games for currently active 100% free deals...' });
+
+        const deals = await fetchActiveDeals();
+
+        if (deals.length === 0) {
+            return { text: 'ℹ️ There are currently no active 100% free game promotions running on Steam or Epic Games.' };
+        }
+
+        // Send summary header
+        await sock.sendMessage(jid, { text: `🎯 Found **${deals.length}** active free game deal(s) right now:` });
+
+        // Send individual cards for each deal
+        for (const deal of deals) {
+            const cardText = `🎮 *${deal.title}* (${deal.store})\n🏷️ *Normal Price:* ~${deal.originalPrice}~\n💸 *Price:* *100% FREE*\n\n🔗 *Store Link:* ${deal.link}`;
+            
+            if (deal.image) {
+                await sock.sendMessage(jid, { image: { url: deal.image }, caption: cardText });
+            } else {
+                await sock.sendMessage(jid, { text: cardText });
+            }
+            await new Promise(resolve => setTimeout(resolve, 1500));
+        }
+    }
 };
 
 function setupConsoleSender(sock) {
