@@ -524,15 +524,49 @@ function startDealsMonitor(sock) {
 // ==========================================
 
 const commands = {
+    '!help': async (args) => {
+        const query = (args || '').trim().toLowerCase();
+
+        if (query === 'sharkny') {
+            return {
+                text: `🦈 *Sharkny Comprehensive Guide* 🦈\n\n` +
+                      `**1. Single Lookups (with optional year parsing):**\n` +
+                      `• \`!sharkny game <title> [year]\`\n` +
+                      `  _Example:_ \`!sharkny game god of war 2005\`\n` +
+                      `• \`!sharkny movie <title> [year]\`\n` +
+                      `  _Example:_ \`!sharkny movie dune 2021\`\n` +
+                      `• \`!sharkny tv <title> [year]\`\n` +
+                      `  _Example:_ \`!sharkny tv daredevil 2015\`\n\n` +
+                      `**2. Lists & Pagination:**\n` +
+                      `• \`!sharkny list <game|movie|tv> popular [page]\`\n` +
+                      `  _Example:_ \`!sharkny list game popular 2\`\n` +
+                      `• \`!sharkny list <game|movie|tv> new [page]\`\n` +
+                      `  _Example:_ \`!sharkny list tv new\`\n` +
+                      `• \`!sharkny list <game|movie|tv> <query> [count]\`\n` +
+                      `  _Example:_ \`!sharkny list movie batman 8\`\n\n` +
+                      `🔗 *Main Platform:* https://sharkny-three.vercel.app`
+            };
+        }
+
+        return {
+            text: `🤖 *Sharkny Bot Command Center* 🤖\n\n` +
+                  `• \`!sharkny ...\` — Search games, movies, TV shows, or browse lists.\n` +
+                  `• \`!ai <prompt>\` — Chat with Gemini (supports replying to images & text context, with auto model failover).\n` +
+                  `• \`!deals\` — View all currently active 100% free games on Steam & Epic Games.\n` +
+                  `• \`!ping\` — Test bot response time.\n` +
+                  `• \`!help sharkny\` — Detailed documentation for Sharkny search & list features.\n\n` +
+                  `💡 _Tip: You can also quote any image or message when using \`!ai\` for analysis!_`
+        };
+    },
     '!sharkny': async (args) => {
         if (!args) {
             return {
-                text: '⚠️ Usage:\n• `!sharkny <game|tv|movie> <query> [year]`\n• `!sharkny list <game|tv|movie> <popular|new|query> [page/count]`'
+                text: '⚠️ Usage:\n• `!sharkny <game|tv|movie> <query> [year]`\n• `!sharkny list <game|tv|movie> <popular|new|query> [page/count]`\n• Type `!help sharkny` for full documentation.'
             };
         }
 
         const firstSpace = args.indexOf(' ');
-        if (firstSpace === -1) return { text: '⚠️ Please include a search query or subcommand.' };
+        if (firstSpace === -1) return { text: '⚠️ Please include a search query or subcommand. Type `!help sharkny` for details.' };
 
         const subCmd = args.slice(0, firstSpace).toLowerCase();
         const rest = args.slice(firstSpace + 1).trim();
@@ -549,7 +583,7 @@ const commands = {
 
         if (subCmd === 'game') return await searchIGDB(rest);
         if (subCmd === 'tv' || subCmd === 'movie') return await searchTMDB(subCmd, rest);
-        return { text: `❌ Unknown type "${subCmd}". Use \`game\`, \`tv\`, \`movie\`, or \`list <type>\`.` };
+        return { text: `❌ Unknown type "${subCmd}". Use \`game\`, \`tv\`, \`movie\`, or \`list <type>\`. Type \`!help\` for commands.` };
     },
     '!ai': handleAI,
     '!ping': async () => ({ text: 'Pong! 🏓' }),
