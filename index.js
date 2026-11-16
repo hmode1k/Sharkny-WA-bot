@@ -40,6 +40,64 @@ function normalizeTitle(str) {
         .trim();
 }
 
+function rankIGDBResults(rawData, cleanQuery, year = null) {
+    const normQuery = normalizeTitle(cleanQuery);
+
+    return rawData
+        .map((g) => {
+            const normName = normalizeTitle(g.name);
+            const gameYear = g.first_release_date ? new Date(g.first_release_date * 1000).getFullYear() : null;
+            const typeCode = g.game_type ?? g.category ?? 0;
+
+            let score = 0;
+            if (normName === normQuery) score += 1000;
+            else if (normName.startsWith(normQuery + ' ')) score += 450;
+            else if (normName.includes(normQuery)) score += 200;
+
+            if (typeCode === 0) score += 300;
+            else if (typeCode === 8 || typeCode === 9) score += 220;
+            else if (typeCode === 4) score += 150;
+            else score -= 150;
+
+            const ratingCount = g.total_rating_count || 0;
+            const hypes = g.hypes || 0;
+            score += Math.min(ratingCount, 2000) * 0.6 + Math.min(hypes, 500) * 0.3;
+
+            if (year && gameYear === year) score += 1500;
+
+            return { ...g, _score: score, _year: gameYear };
+        })
+        .sort((a, b) => b._score - a._score);
+}
+
+function rankTMDBResults(results, cleanQuery, year = null) {
+    const normQuery = normalizeTitle(cleanQuery);
+
+    return results
+        .map((entry) => {
+            const entryTitle = entry.title || entry.name || '';
+            const origTitle = entry.original_title || entry.original_name || '';
+            const normTitle = normalizeTitle(entryTitle);
+            const normOrig = normalizeTitle(origTitle);
+            const rawDate = entry.release_date || entry.first_air_date;
+            const entryYear = rawDate ? new Date(rawDate).getFullYear() : null;
+
+            let score = 0;
+            if (normTitle === normQuery || normOrig === normQuery) score += 1000;
+            else if (normTitle.startsWith(normQuery + ' ')) score += 300;
+            else if (normTitle.includes(normQuery)) score += 100;
+
+            const voteCount = entry.vote_count || 0;
+            const popularity = entry.popularity || 0;
+            score += Math.min(voteCount, 10000) * 0.25 + Math.min(popularity, 500) * 0.5;
+
+            if (year && entryYear === year) score += 1500;
+
+            return { ...entry, _score: score, _year: entryYear };
+        })
+        .sort((a, b) => b._score - a._score);
+}
+
 async function searchIGDB(rawQuery) {
     const clientId = process.env.TWITCH_CLIENT_ID;
     const accessToken = process.env.IGDB_ACCESS_TOKEN;
@@ -67,34 +125,7 @@ async function searchIGDB(rawQuery) {
             return { text: `❌ No games found matching "${rawQuery}" on IGDB.` };
         }
 
-        const normQuery = normalizeTitle(cleanQuery);
-
-        const ranked = rawData
-            .map((g) => {
-                const normName = normalizeTitle(g.name);
-                const gameYear = g.first_release_date ? new Date(g.first_release_date * 1000).getFullYear() : null;
-                const typeCode = g.game_type ?? g.category ?? 0;
-
-                let score = 0;
-                if (normName === normQuery) score += 1000;
-                else if (normName.startsWith(normQuery + ' ')) score += 450;
-                else if (normName.includes(normQuery)) score += 200;
-
-                if (typeCode === 0) score += 300;
-                else if (typeCode === 8 || typeCode === 9) score += 220;
-                else if (typeCode === 4) score += 150;
-                else score -= 150;
-
-                const ratingCount = g.total_rating_count || 0;
-                const hypes = g.hypes || 0;
-                score += Math.min(ratingCount, 2000) * 0.6 + Math.min(hypes, 500) * 0.3;
-
-                if (year && gameYear === year) score += 1500;
-
-                return { ...g, _score: score, _year: gameYear };
-            })
-            .sort((a, b) => b._score - a._score);
-
+        const ranked = rankIGDBResults(rawData, cleanQuery, year);
         const game = ranked[0];
         const runnersUp = ranked.slice(1, 3).map((g) => `${g.name}${g._year ? ` (${g._year})` : ''}`);
 
@@ -118,92 +149,91 @@ async function searchIGDB(rawQuery) {
     }
 }
 
-// ==========================================
-// NEW: IGDB LIST & PAGINATION HANDLER
-// ==========================================
 async function listIGDBGames(subArg) {
     const clientId = process.env.TWITCH_CLIENT_ID;
     const accessToken = process.env.IGDB_ACCESS_TOKEN;
 
     if (!clientId || !accessToken) {
-        return '⚠️ IGDB credentials are missing in your .env file.';
+        return { text: '⚠️ IGDB credentials are missing in your .env file.' };
     }
 
-    // Parse command: popular [page], new [page], or <query> [limit]
-    let mode = 'search';
-    let queryTerm = '';
-    let page = 1;
-    let limit = 10;
+    if (!subArg) {
+        return { text: '⚠️ Usage:\n• `!sharkny list game popular [page]`\n• `!sharkny list game new [page]`\n• `!sharkny list game <query> [1-10]`' };
+    }
 
-    const parts = subArg.split(' ');
-    const firstToken = parts[0]?.toLowerCase();
+    const parts = subArg.trim().split(/\s+/);
+    const firstToken = parts[0].toLowerCase();
+
+    let mode = 'search';
+    let page = 1;
+    let count = 5;
+    let queryTerm = '';
 
     if (firstToken === 'popular' || firstToken === 'new') {
         mode = firstToken;
-        if (parts[1] && !isNaN(parts[1])) {
-            page = parseInt(parts[1], 10);
+        count = 10;
+        if (parts[1] && /^\d+$/.test(parts[1])) {
+            page = Math.max(1, parseInt(parts[1], 10));
         }
     } else {
-        // Check if last token is a number specifying result count (e.g. "cyberpunk 5")
         const lastToken = parts[parts.length - 1];
-        if (parts.length > 1 && !isNaN(lastToken)) {
-            limit = Math.min(parseInt(lastToken, 10), 15); // max 15 per list
+        if (parts.length > 1 && /^\d+$/.test(lastToken)) {
+            count = Math.min(10, Math.max(1, parseInt(lastToken, 10)));
             queryTerm = parts.slice(0, -1).join(' ');
         } else {
-            queryTerm = subArg;
+            queryTerm = subArg.trim();
         }
     }
 
-    const currentTimeSec = Math.floor(Date.now() / 1000);
-    let apicalypseBody = '';
+    const nowSec = Math.floor(Date.now() / 1000);
+    const thirtyDaysAgoSec = nowSec - 30 * 24 * 60 * 60;
+    const offset = (page - 1) * count;
+    let body = '';
 
     if (mode === 'popular') {
-        // Popular games based on rating count & hypes
-        const offset = (page - 1) * 10;
-        apicalypseBody = `fields name, total_rating, total_rating_count, first_release_date, id; where version_parent = null & total_rating_count != null; sort total_rating_count desc; limit 10; offset ${offset};`;
+        body = `fields name, total_rating, total_rating_count, hypes, first_release_date, id; where version_parent = null & cover != null & first_release_date >= ${thirtyDaysAgoSec} & first_release_date <= ${nowSec}; sort hypes desc; limit ${count}; offset ${offset};`;
     } else if (mode === 'new') {
-        // Newest games released up to now
-        const offset = (page - 1) * 10;
-        apicalypseBody = `fields name, total_rating, first_release_date, id; where version_parent = null & first_release_date != null & first_release_date <= ${currentTimeSec}; sort first_release_date desc; limit 10; offset ${offset};`;
+        body = `fields name, total_rating, first_release_date, id; where version_parent = null & cover != null & first_release_date >= ${thirtyDaysAgoSec} & first_release_date <= ${nowSec}; sort first_release_date desc; limit ${count}; offset ${offset};`;
     } else {
-        // Keyword Search list
         const safeQuery = queryTerm.replace(/"/g, '\\"');
-        apicalypseBody = `search "${safeQuery}"; fields name, total_rating, first_release_date, id; where version_parent = null; limit ${limit};`;
+        body = `search "${safeQuery}"; fields name, total_rating, total_rating_count, hypes, first_release_date, game_type, category, id; where version_parent = null; limit 20;`;
     }
 
     try {
-        const endpoint = (mode === 'search') ? 'search' : 'games';
-        const igdbRes = await fetch(`https://api.igdb.com/v4/${endpoint}`, {
+        const igdbRes = await fetch('https://api.igdb.com/v4/games', {
             method: 'POST',
             headers: {
                 'Client-ID': clientId,
                 'Authorization': `Bearer ${accessToken}`,
                 'Content-Type': 'text/plain',
             },
-            body: apicalypseBody
+            body
         });
 
         const rawData = await igdbRes.json();
         if (!Array.isArray(rawData) || rawData.length === 0) {
-            return `❌ No games found for query "${subArg}".`;
+            return { text: `❌ No games found for \`!sharkny list game ${subArg}\`.` };
         }
 
-        let titleHeader = `🎮 *Sharkny Game List* (${mode.toUpperCase()}${page > 1 ? ` - Page ${page}` : ''}):\n\n`;
-        if (mode === 'search') {
-            titleHeader = `🎮 *Search Results for "${queryTerm}"*:\n\n`;
-        }
+        const results = mode === 'search' ? rankIGDBResults(rawData, queryTerm).slice(0, count) : rawData;
 
-        const listItems = rawData.map((g, index) => {
-            const year = g.first_release_date ? new Date(g.first_release_date * 1000).getFullYear() : 'N/A';
-            const rating = g.total_rating ? `⭐ ${Math.round(g.total_rating)}/100` : '';
-            const link = `https://sharkny-three.vercel.app/game/${g.id}`;
-            return `*${index + 1}.* *${g.name}* (${year}) ${rating}\n🔗 ${link}`;
+        let header = '';
+        if (mode === 'popular') header = `🔥 *Popular Games (Last 30 Days — Page ${page})*\n\n`;
+        else if (mode === 'new') header = `🆕 *Newest Releases (Last 30 Days — Page ${page})*\n\n`;
+        else header = `🎮 *Top ${results.length} Game Results for "${queryTerm}"*\n\n`;
+
+        const lines = results.map((g, idx) => {
+            const rankNum = mode === 'search' ? idx + 1 : offset + idx + 1;
+            const dateStr = g.first_release_date ? new Date(g.first_release_date * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'TBA';
+            const ratingStr = g.total_rating ? ` | ⭐ ${Math.round(g.total_rating)}/100` : '';
+            return `*${rankNum}. ${g.name}* (${dateStr}${ratingStr})\n🔗 https://sharkny-three.vercel.app/game/${g.id}`;
         });
 
-        return titleHeader + listItems.join('\n\n');
+        const footer = (mode === 'popular' || mode === 'new') ? `\n\n📄 _Next page:_ \`!sharkny list game ${mode} ${page + 1}\`` : '';
+        return { text: header + lines.join('\n\n') + footer };
     } catch (error) {
         console.error('IGDB List Error:', error);
-        return '❌ Failed to fetch game list from IGDB.';
+        return { text: '❌ Failed to fetch game list from IGDB.' };
     }
 }
 
@@ -231,27 +261,7 @@ async function searchTMDB(mediaType, rawQuery) {
             return { text: `❌ No results found matching "${rawQuery}" on TMDB.` };
         }
 
-        const normQuery = normalizeTitle(cleanQuery);
-        const ranked = searchData.results
-            .slice(0, 15)
-            .map((entry) => {
-                const entryTitle = entry.title || entry.name || '';
-                const normTitle = normalizeTitle(entryTitle);
-                const rawDate = entry.release_date || entry.first_air_date;
-                const entryYear = rawDate ? new Date(rawDate).getFullYear() : null;
-
-                let score = 0;
-                if (normTitle === normQuery) score += 1000;
-                else if (normTitle.startsWith(normQuery + ' ')) score += 300;
-                else if (normTitle.includes(normQuery)) score += 100;
-
-                score += Math.min(entry.vote_count || 0, 10000) * 0.25 + Math.min(entry.popularity || 0, 500) * 0.5;
-                if (year && entryYear === year) score += 1500;
-
-                return { ...entry, _score: score, _year: entryYear };
-            })
-            .sort((a, b) => b._score - a._score);
-
+        const ranked = rankTMDBResults(searchData.results, cleanQuery, year);
         const bestMatch = ranked[0];
         const runnersUp = ranked.slice(1, 3).map((r) => `${r.title || r.name}${r._year ? ` (${r._year})` : ''}`);
 
@@ -287,6 +297,89 @@ async function searchTMDB(mediaType, rawQuery) {
     } catch (error) {
         console.error('TMDB Error:', error);
         return { text: '❌ Failed to fetch media details from TMDB.' };
+    }
+}
+
+async function listTMDBMedia(mediaType, subArg) {
+    const tmdbToken = process.env.TMDB_ACCESS_TOKEN;
+    if (!tmdbToken) {
+        return { text: '⚠️ TMDB access token is missing in your .env file.' };
+    }
+
+    if (!subArg) {
+        return { text: `⚠️ Usage:\n• \`!sharkny list ${mediaType} popular [page]\`\n• \`!sharkny list ${mediaType} new [page]\`\n• \`!sharkny list ${mediaType} <query> [1-10]\`` };
+    }
+
+    const parts = subArg.trim().split(/\s+/);
+    const firstToken = parts[0].toLowerCase();
+
+    let mode = 'search';
+    let page = 1;
+    let count = 5;
+    let queryTerm = '';
+
+    if (firstToken === 'popular' || firstToken === 'new') {
+        mode = firstToken;
+        count = 10;
+        if (parts[1] && /^\d+$/.test(parts[1])) {
+            page = Math.max(1, parseInt(parts[1], 10));
+        }
+    } else {
+        const lastToken = parts[parts.length - 1];
+        if (parts.length > 1 && /^\d+$/.test(lastToken)) {
+            count = Math.min(10, Math.max(1, parseInt(lastToken, 10)));
+            queryTerm = parts.slice(0, -1).join(' ');
+        } else {
+            queryTerm = subArg.trim();
+        }
+    }
+
+    const endpoint = mediaType === 'tv' ? 'tv' : 'movie';
+    let fetchUrl = '';
+
+    if (mode === 'popular') {
+        fetchUrl = `https://api.themoviedb.org/3/${endpoint}/popular?language=en-US&page=${page}`;
+    } else if (mode === 'new') {
+        fetchUrl = mediaType === 'tv'
+            ? `https://api.themoviedb.org/3/tv/on_the_air?language=en-US&page=${page}`
+            : `https://api.themoviedb.org/3/movie/now_playing?language=en-US&page=${page}`;
+    } else {
+        fetchUrl = `https://api.themoviedb.org/3/search/${endpoint}?query=${encodeURIComponent(queryTerm)}&include_adult=false&language=en-US&page=1`;
+    }
+
+    try {
+        const res = await fetch(fetchUrl, {
+            headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' }
+        });
+        const data = await res.json();
+        if (!data.results || data.results.length === 0) {
+            return { text: `❌ No results found for \`!sharkny list ${mediaType} ${subArg}\`.` };
+        }
+
+        const results = mode === 'search'
+            ? rankTMDBResults(data.results, queryTerm).slice(0, count)
+            : data.results.slice(0, count);
+
+        const typeTitle = mediaType === 'tv' ? 'TV Shows' : 'Movies';
+        let header = '';
+        if (mode === 'popular') header = `🔥 *Popular ${typeTitle} (Page ${page})*\n\n`;
+        else if (mode === 'new') header = `🆕 *New / Airing ${typeTitle} (Page ${page})*\n\n`;
+        else header = `🎬 *Top ${results.length} ${typeTitle} for "${queryTerm}"*\n\n`;
+
+        const lines = results.map((item, idx) => {
+            const rankNum = mode === 'search' ? idx + 1 : ((page - 1) * count) + idx + 1;
+            const title = item.title || item.name || 'Unknown';
+            const rawDate = item.release_date || item.first_air_date;
+            const year = rawDate ? new Date(rawDate).getFullYear() : 'N/A';
+            const rating = item.vote_average ? ` | ⭐ ${item.vote_average.toFixed(1)}/10` : '';
+            return `*${rankNum}. ${title}* (${year}${rating})\n🔗 https://sharkny-three.vercel.app/${endpoint}/${item.id}`;
+        });
+
+        const footer = (mode === 'popular' || mode === 'new') ? `\n\n📄 _Next page:_ \`!sharkny list ${mediaType} ${mode} ${page + 1}\`` : '';
+        return { text: header + lines.join('\n\n') + footer };
+    } catch (error) {
+        console.error('TMDB List Error:', error);
+        return { text: `❌ Failed to fetch ${mediaType} list from TMDB.` };
     }
 }
 
@@ -431,35 +524,32 @@ function startDealsMonitor(sock) {
 // ==========================================
 
 const commands = {
-    '!sharkny': async (args, msg, sock) => {
-        if (!args) return { text: '⚠️ Usage:\n• `!sharkny game <query>`\n• `!sharkny tv <query>`\n• `!sharkny movie <query>`\n• `!sharkny list game <popular|new|query> [page/limit]`' };
-        
-        const firstSpace = args.indexOf(' ');
-        if (firstSpace === -1) return { text: '⚠️ Invalid format.' };
-
-        const modeOrType = args.slice(0, firstSpace).toLowerCase();
-        const rest = args.slice(firstSpace + 1).trim();
-
-        // Handle list command: !sharkny list game ...
-        if (modeOrType === 'list') {
-            const secondSpace = rest.indexOf(' ');
-            const category = secondSpace === -1 ? rest.toLowerCase() : rest.slice(0, secondSpace).toLowerCase();
-            const subArg = secondSpace === -1 ? '' : rest.slice(secondSpace + 1).trim();
-
-            if (category === 'game') {
-                const listResultText = await listIGDBGames(subArg);
-                return { text: listResultText };
-            } else {
-                return { text: `❌ Unknown list category "${category}". Currently supported: \`!sharkny list game ...\`` };
-            }
+    '!sharkny': async (args) => {
+        if (!args) {
+            return {
+                text: '⚠️ Usage:\n• `!sharkny <game|tv|movie> <query> [year]`\n• `!sharkny list <game|tv|movie> <popular|new|query> [page/count]`'
+            };
         }
 
-        // Handle standard single search: !sharkny game/tv/movie <query>
-        const query = rest;
-        if (modeOrType === 'game') return await searchIGDB(query);
-        if (modeOrType === 'tv' || modeOrType === 'movie') return await searchTMDB(modeOrType, query);
-        
-        return { text: `❌ Unknown subcommand "${modeOrType}". Use \`game\`, \`tv\`, \`movie\`, or \`list game\`.` };
+        const firstSpace = args.indexOf(' ');
+        if (firstSpace === -1) return { text: '⚠️ Please include a search query or subcommand.' };
+
+        const subCmd = args.slice(0, firstSpace).toLowerCase();
+        const rest = args.slice(firstSpace + 1).trim();
+
+        if (subCmd === 'list') {
+            const secondSpace = rest.indexOf(' ');
+            const listType = (secondSpace === -1 ? rest : rest.slice(0, secondSpace)).toLowerCase();
+            const listArgs = secondSpace === -1 ? '' : rest.slice(secondSpace + 1).trim();
+
+            if (listType === 'game') return await listIGDBGames(listArgs);
+            if (listType === 'movie' || listType === 'tv') return await listTMDBMedia(listType, listArgs);
+            return { text: `❌ Unknown list type "${listType}". Use \`game\`, \`movie\`, or \`tv\`.` };
+        }
+
+        if (subCmd === 'game') return await searchIGDB(rest);
+        if (subCmd === 'tv' || subCmd === 'movie') return await searchTMDB(subCmd, rest);
+        return { text: `❌ Unknown type "${subCmd}". Use \`game\`, \`tv\`, \`movie\`, or \`list <type>\`.` };
     },
     '!ai': handleAI,
     '!ping': async () => ({ text: 'Pong! 🏓' }),
@@ -467,9 +557,9 @@ const commands = {
         const jid = msg.key.remoteJid;
         await sock.sendMessage(jid, { text: '🔍 Scanning Steam and Epic Games for currently active 100% free deals...' });
         const deals = await fetchActiveDeals();
-        if (deals.length === 0) return { text: 'ℹ️ There are currently no active 100% free game promotions.' };
+        if (deals.length === 0) return { text: 'ℹ️ There are currently no active 100% free game promotions running.' };
 
-        await sock.sendMessage(jid, { text: `🎯 Found *${deals.length}* active free game deal(s):` });
+        await sock.sendMessage(jid, { text: `🎯 Found *${deals.length}* active free game deal(s) right now:` });
         for (const deal of deals) {
             const cardText = `🎮 *${deal.title}* (${deal.store})\n🏷️ *Normal Price:* ~${deal.originalPrice}~\n💸 *Price:* *100% FREE*\n\n🔗 *Store Link:* ${deal.link}`;
             if (deal.image) {
@@ -491,12 +581,13 @@ function setupConsoleSender(sock) {
         const target = parts[1];
         const messageText = parts.slice(2).join(' ');
         if (action === 'send' && target && messageText) {
-            const jid = `${target.replace(/[^0-9]/g, '')}@s.whatsapp.net`;
+            const cleanNumber = target.replace(/[^0-9]/g, '');
+            const jid = `${cleanNumber}@s.whatsapp.net`;
             try {
                 await sock.sendMessage(jid, { text: messageText });
                 console.log(`✅ [Console] Sent message to ${jid}`);
             } catch (error) {
-                console.error(`❌ Failed:`, error);
+                console.error(`❌ [Console] Failed to send to ${jid}:`, error);
             }
         }
     });
@@ -513,7 +604,10 @@ async function connectToWhatsApp() {
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
-        if (qr) qrcode.generate(qr, { small: true });
+        if (qr) {
+            console.log('Scan the QR code below to connect:');
+            qrcode.generate(qr, { small: true });
+        }
         if (connection === 'close') {
             if (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut) connectToWhatsApp();
         } else if (connection === 'open') {
