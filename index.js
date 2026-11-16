@@ -18,10 +18,30 @@ const AI_MODELS = [
 ];
 
 // ==========================================
-// 1. API HELPER FUNCTIONS (IGDB, TMDB, GEMINI)
+// 1. SEARCH & RANKING HELPERS (IGDB, TMDB, GEMINI)
 // ==========================================
 
-async function searchIGDB(query) {
+// Extracts a trailing 4-digit year if present (e.g., "daredevil 2025" -> { cleanQuery: "daredevil", year: 2025 })
+function parseQueryAndYear(rawQuery) {
+    const match = rawQuery.match(/^(.*?)(?:\s+\(?((?:19|20)\d{2})\)?)$/);
+    if (match && match[1].trim().length > 0) {
+        return {
+            cleanQuery: match[1].trim(),
+            year: parseInt(match[2], 10)
+        };
+    }
+    return { cleanQuery: rawQuery.trim(), year: null };
+}
+
+function normalizeTitle(str) {
+    return (str || '')
+        .toLowerCase()
+        .replace(/[:\-–—'’.,!?]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+async function searchIGDB(rawQuery) {
     const clientId = process.env.TWITCH_CLIENT_ID;
     const accessToken = process.env.IGDB_ACCESS_TOKEN;
 
@@ -30,7 +50,9 @@ async function searchIGDB(query) {
     }
 
     try {
-        console.log(`[IGDB API] Querying games for: "${query}"`);
+        const { cleanQuery, year } = parseQueryAndYear(rawQuery);
+        const safeQuery = cleanQuery.replace(/"/g, '\\"');
+        console.log(`[IGDB API] Querying games for: "${cleanQuery}"${year ? ` (Year: ${year})` : ''}`);
 
         const igdbRes = await fetch('https://api.igdb.com/v4/games', {
             method: 'POST',
@@ -39,22 +61,61 @@ async function searchIGDB(query) {
                 'Authorization': `Bearer ${accessToken}`,
                 'Content-Type': 'text/plain',
             },
-            body: `search "${query}"; fields name, summary, total_rating, first_release_date, cover.image_id, platforms.name, id; limit 1;`
+            body: `search "${safeQuery}"; fields name, summary, total_rating, total_rating_count, hypes, first_release_date, cover.image_id, platforms.name, game_type, category, id; where version_parent = null; limit 20;`
         });
 
         const rawData = await igdbRes.json();
-        if (!rawData || rawData.length === 0) {
-            return { text: `❌ No games found matching "${query}" on IGDB.` };
+        if (!Array.isArray(rawData) || rawData.length === 0) {
+            return { text: `❌ No games found matching "${rawQuery}" on IGDB.` };
         }
 
-        const game = rawData[0];
-        const releaseYear = game.first_release_date ? new Date(game.first_release_date * 1000).getFullYear() : 'Unknown';
+        const normQuery = normalizeTitle(cleanQuery);
+
+        // Score and rank candidates so main titles & popular games beat DLCs/fangames
+        const ranked = rawData
+            .map((g) => {
+                const normName = normalizeTitle(g.name);
+                const gameYear = g.first_release_date ? new Date(g.first_release_date * 1000).getFullYear() : null;
+                const typeCode = g.game_type ?? g.category ?? 0;
+
+                let score = 0;
+
+                // 1. Title similarity
+                if (normName === normQuery) score += 1000;
+                else if (normName.startsWith(normQuery + ' ')) score += 450;
+                else if (normName.includes(normQuery)) score += 200;
+
+                // 2. Game type weight (0 = Main Game, 8 = Remake, 9 = Remaster)
+                if (typeCode === 0) score += 300;
+                else if (typeCode === 8 || typeCode === 9) score += 220;
+                else if (typeCode === 4) score += 150; // Standalone expansion
+                else score -= 150; // DLC, bundle, mod, episode
+
+                // 3. Popularity & rating count
+                const ratingCount = g.total_rating_count || 0;
+                const hypes = g.hypes || 0;
+                score += Math.min(ratingCount, 2000) * 0.6 + Math.min(hypes, 500) * 0.3;
+
+                // 4. Optional year filter boost
+                if (year && gameYear === year) score += 1500;
+
+                return { ...g, _score: score, _year: gameYear };
+            })
+            .sort((a, b) => b._score - a._score);
+
+        const game = ranked[0];
+        const runnersUp = ranked
+            .slice(1, 3)
+            .map((g) => `${g.name}${g._year ? ` (${g._year})` : ''}`);
+
+        const releaseYear = game._year || 'Unknown';
         const rating = game.total_rating ? Math.round(game.total_rating) + '/100' : 'N/A';
         const summary = game.summary ? game.summary.slice(0, 300) + '...' : 'No summary available.';
         const platformsList = game.platforms ? game.platforms.map(p => p.name).join(', ') : 'Not specified';
 
         const sharknyLink = `\n\n🔗 *View on Sharkny:* https://sharkny-three.vercel.app/game/${game.id}`;
-        const captionText = `🎮 *${game.name}* (${releaseYear})\n\n⭐ *Rating:* ${rating}\n\n🖥️ *Platforms:* ${platformsList}\n\n📝 *Overview:* ${summary}${sharknyLink}`;
+        const alternativesFooter = runnersUp.length > 0 ? `\n\n🔎 *Other matches:* ${runnersUp.join(' • ')}` : '';
+        const captionText = `🎮 *${game.name}* (${releaseYear})\n\n⭐ *Rating:* ${rating}\n\n🖥️ *Platforms:* ${platformsList}\n\n📝 *Overview:* ${summary}${sharknyLink}${alternativesFooter}`;
 
         const imageUrl = game.cover?.image_id
             ? `https://images.igdb.com/igdb/image/upload/t_cover_big/${game.cover.image_id}.jpg`
@@ -67,7 +128,7 @@ async function searchIGDB(query) {
     }
 }
 
-async function searchTMDB(mediaType, query) {
+async function searchTMDB(mediaType, rawQuery) {
     const tmdbToken = process.env.TMDB_ACCESS_TOKEN;
     if (!tmdbToken) {
         return { text: '⚠️ TMDB access token is missing in your .env file.' };
@@ -75,19 +136,61 @@ async function searchTMDB(mediaType, query) {
 
     try {
         const endpoint = mediaType === 'tv' ? 'tv' : 'movie';
-        console.log(`[TMDB API] Searching ${endpoint} for: "${query}"`);
+        const { cleanQuery, year } = parseQueryAndYear(rawQuery);
+        console.log(`[TMDB API] Searching ${endpoint} for: "${cleanQuery}"${year ? ` (Year: ${year})` : ''}`);
 
-        const searchRes = await fetch(`https://api.themoviedb.org/3/search/${endpoint}?query=${encodeURIComponent(query)}`, {
+        let searchUrl = `https://api.themoviedb.org/3/search/${endpoint}?query=${encodeURIComponent(cleanQuery)}&include_adult=false&language=en-US&page=1`;
+        if (year) {
+            searchUrl += endpoint === 'tv' ? `&first_air_date_year=${year}` : `&primary_release_year=${year}`;
+        }
+
+        const searchRes = await fetch(searchUrl, {
             headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' }
         });
 
         const searchData = await searchRes.json();
         if (!searchData.results || searchData.results.length === 0) {
-            return { text: `❌ No results found matching "${query}" on TMDB.` };
+            return { text: `❌ No results found matching "${rawQuery}" on TMDB.` };
         }
 
-        const itemId = searchData.results[0].id;
-        const detailsRes = await fetch(`https://api.themoviedb.org/3/${endpoint}/${itemId}`, {
+        const normQuery = normalizeTitle(cleanQuery);
+
+        // Score top 15 results so exact title + established vote_count beats trending spin-offs
+        const ranked = searchData.results
+            .slice(0, 15)
+            .map((entry) => {
+                const entryTitle = entry.title || entry.name || '';
+                const origTitle = entry.original_title || entry.original_name || '';
+                const normTitle = normalizeTitle(entryTitle);
+                const normOrig = normalizeTitle(origTitle);
+                const rawDate = entry.release_date || entry.first_air_date;
+                const entryYear = rawDate ? new Date(rawDate).getFullYear() : null;
+
+                let score = 0;
+
+                // 1. Exact vs prefix title match
+                if (normTitle === normQuery || normOrig === normQuery) score += 1000;
+                else if (normTitle.startsWith(normQuery + ' ')) score += 300;
+                else if (normTitle.includes(normQuery)) score += 100;
+
+                // 2. Vote count & popularity balance
+                const voteCount = entry.vote_count || 0;
+                const popularity = entry.popularity || 0;
+                score += Math.min(voteCount, 10000) * 0.25 + Math.min(popularity, 500) * 0.5;
+
+                // 3. Year match bonus
+                if (year && entryYear === year) score += 1500;
+
+                return { ...entry, _score: score, _year: entryYear };
+            })
+            .sort((a, b) => b._score - a._score);
+
+        const bestMatch = ranked[0];
+        const runnersUp = ranked
+            .slice(1, 3)
+            .map((r) => `${r.title || r.name}${r._year ? ` (${r._year})` : ''}`);
+
+        const detailsRes = await fetch(`https://api.themoviedb.org/3/${endpoint}/${bestMatch.id}`, {
             headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' }
         });
 
@@ -110,7 +213,8 @@ async function searchTMDB(mediaType, query) {
 
         const typeEmoji = mediaType === 'tv' ? '📺' : '🎬';
         const sharknyLink = `\n\n🔗 *View on Sharkny:* https://sharkny-three.vercel.app/${endpoint}/${item.id}`;
-        const captionText = `${typeEmoji} *${title}* (${releaseYear})\n\n⭐ *Rating:* ${rating}${extraStats}\n\n📝 *Overview:* ${overview}${sharknyLink}`;
+        const alternativesFooter = runnersUp.length > 0 ? `\n\n🔎 *Other matches:* ${runnersUp.join(' • ')}` : '';
+        const captionText = `${typeEmoji} *${title}* (${releaseYear})\n\n⭐ *Rating:* ${rating}${extraStats}\n\n📝 *Overview:* ${overview}${sharknyLink}${alternativesFooter}`;
 
         const imageUrl = item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null;
 
@@ -241,7 +345,6 @@ function saveSentDeal(dealKey) {
     }
 }
 
-// Core fetcher function used by both background monitoring and the !deals command
 async function fetchActiveDeals() {
     let dealsList = [];
 
@@ -312,7 +415,6 @@ async function fetchActiveDeals() {
     return dealsList;
 }
 
-// Background Automated Monitor (checks every 3 hours and alerts ALERT_TARGET_JID)
 async function checkFreeGames(sock) {
     const targetJid = process.env.ALERT_TARGET_JID;
     if (!targetJid) return;
@@ -352,7 +454,7 @@ function startDealsMonitor(sock) {
 
 const commands = {
     '!sharkny': async (args) => {
-        if (!args) return { text: '⚠️ Usage: `!sharkny <game|tv|movie> <query>`' };
+        if (!args) return { text: '⚠️ Usage: `!sharkny <game|tv|movie> <query> [year]`' };
         const firstSpace = args.indexOf(' ');
         if (firstSpace === -1) return { text: '⚠️ Please include a search query.' };
         const type = args.slice(0, firstSpace).toLowerCase();
@@ -374,13 +476,11 @@ const commands = {
             return { text: 'ℹ️ There are currently no active 100% free game promotions running on Steam or Epic Games.' };
         }
 
-        // Send summary header
-        await sock.sendMessage(jid, { text: `🎯 Found **${deals.length}** active free game deal(s) right now:` });
+        await sock.sendMessage(jid, { text: `🎯 Found *${deals.length}* active free game deal(s) right now:` });
 
-        // Send individual cards for each deal
         for (const deal of deals) {
             const cardText = `🎮 *${deal.title}* (${deal.store})\n🏷️ *Normal Price:* ~${deal.originalPrice}~\n💸 *Price:* *100% FREE*\n\n🔗 *Store Link:* ${deal.link}`;
-            
+
             if (deal.image) {
                 await sock.sendMessage(jid, { image: { url: deal.image }, caption: cardText });
             } else {
