@@ -149,16 +149,18 @@ async function searchIGDB(rawQuery) {
     }
 }
 
-async function listIGDBGames(subArg) {
+async function listIGDBGames(subArg, sock, jid) {
     const clientId = process.env.TWITCH_CLIENT_ID;
     const accessToken = process.env.IGDB_ACCESS_TOKEN;
 
     if (!clientId || !accessToken) {
-        return { text: '⚠️ IGDB credentials are missing in your .env file.' };
+        await sock.sendMessage(jid, { text: '⚠️ IGDB credentials are missing in your .env file.' });
+        return;
     }
 
     if (!subArg) {
-        return { text: '⚠️ Usage:\n• `!sharkny list game popular [page]`\n• `!sharkny list game new [page]`\n• `!sharkny list game <query> [1-10]`' };
+        await sock.sendMessage(jid, { text: '⚠️ Usage:\n• `!sharkny list game popular [page]`\n• `!sharkny list game new [page]`\n• `!sharkny list game <query> [page]`' });
+        return;
     }
 
     const parts = subArg.trim().split(/\s+/);
@@ -166,19 +168,18 @@ async function listIGDBGames(subArg) {
 
     let mode = 'search';
     let page = 1;
-    let count = 5;
     let queryTerm = '';
+    const pageSize = 5;
 
     if (firstToken === 'popular' || firstToken === 'new') {
         mode = firstToken;
-        count = 10;
         if (parts[1] && /^\d+$/.test(parts[1])) {
             page = Math.max(1, parseInt(parts[1], 10));
         }
     } else {
         const lastToken = parts[parts.length - 1];
         if (parts.length > 1 && /^\d+$/.test(lastToken)) {
-            count = Math.min(10, Math.max(1, parseInt(lastToken, 10)));
+            page = Math.max(1, parseInt(lastToken, 10));
             queryTerm = parts.slice(0, -1).join(' ');
         } else {
             queryTerm = subArg.trim();
@@ -187,16 +188,18 @@ async function listIGDBGames(subArg) {
 
     const nowSec = Math.floor(Date.now() / 1000);
     const thirtyDaysAgoSec = nowSec - 30 * 24 * 60 * 60;
-    const offset = (page - 1) * count;
+    const offset = (page - 1) * pageSize;
     let body = '';
 
     if (mode === 'popular') {
-        body = `fields name, total_rating, total_rating_count, hypes, first_release_date, id; where version_parent = null & cover != null & first_release_date >= ${thirtyDaysAgoSec} & first_release_date <= ${nowSec}; sort hypes desc; limit ${count}; offset ${offset};`;
+        body = `fields name, total_rating, total_rating_count, hypes, first_release_date, cover.image_id, id; where version_parent = null & cover != null & first_release_date >= ${thirtyDaysAgoSec} & first_release_date <= ${nowSec}; sort hypes desc; limit ${pageSize}; offset ${offset};`;
     } else if (mode === 'new') {
-        body = `fields name, total_rating, first_release_date, id; where version_parent = null & cover != null & first_release_date >= ${thirtyDaysAgoSec} & first_release_date <= ${nowSec}; sort first_release_date desc; limit ${count}; offset ${offset};`;
+        body = `fields name, total_rating, first_release_date, cover.image_id, id; where version_parent = null & cover != null & first_release_date >= ${thirtyDaysAgoSec} & first_release_date <= ${nowSec}; sort first_release_date desc; limit ${pageSize}; offset ${offset};`;
     } else {
         const safeQuery = queryTerm.replace(/"/g, '\\"');
-        body = `search "${safeQuery}"; fields name, total_rating, total_rating_count, hypes, first_release_date, game_type, category, id; where version_parent = null; limit 20;`;
+        // Fetch enough results to support pagination across ranked items
+        const fetchLimit = Math.max(20, page * pageSize);
+        body = `search "${safeQuery}"; fields name, total_rating, total_rating_count, hypes, first_release_date, cover.image_id, game_type, category, id; where version_parent = null; limit ${fetchLimit};`;
     }
 
     try {
@@ -212,28 +215,54 @@ async function listIGDBGames(subArg) {
 
         const rawData = await igdbRes.json();
         if (!Array.isArray(rawData) || rawData.length === 0) {
-            return { text: `❌ No games found for \`!sharkny list game ${subArg}\`.` };
+            await sock.sendMessage(jid, { text: `❌ No games found for \`!sharkny list game ${subArg}\`.` });
+            return;
         }
 
-        const results = mode === 'search' ? rankIGDBResults(rawData, queryTerm).slice(0, count) : rawData;
+        let results = [];
+        if (mode === 'search') {
+            const ranked = rankIGDBResults(rawData, queryTerm);
+            results = ranked.slice(offset, offset + pageSize);
+        } else {
+            results = rawData;
+        }
+
+        if (results.length === 0) {
+            await sock.sendMessage(jid, { text: `ℹ️ No more results found on page ${page}.` });
+            return;
+        }
 
         let header = '';
-        if (mode === 'popular') header = `🔥 *Popular Games (Last 30 Days — Page ${page})*\n\n`;
-        else if (mode === 'new') header = `🆕 *Newest Releases (Last 30 Days — Page ${page})*\n\n`;
-        else header = `🎮 *Top ${results.length} Game Results for "${queryTerm}"*\n\n`;
+        if (mode === 'popular') header = `🔥 *Popular Games (Last 30 Days — Page ${page})*:\n`;
+        else if (mode === 'new') header = `🆕 *Newest Releases (Last 30 Days — Page ${page})*:\n`;
+        else header = `🎮 *Game Results for "${queryTerm}" (Page ${page})*:\n`;
 
-        const lines = results.map((g, idx) => {
-            const rankNum = mode === 'search' ? idx + 1 : offset + idx + 1;
-            const dateStr = g.first_release_date ? new Date(g.first_release_date * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'TBA';
+        await sock.sendMessage(jid, { text: header });
+
+        for (let idx = 0; idx < results.length; idx++) {
+            const g = results[idx];
+            const rankNum = offset + idx + 1;
+            const year = g.first_release_date ? new Date(g.first_release_date * 1000).getFullYear() : 'N/A';
             const ratingStr = g.total_rating ? ` | ⭐ ${Math.round(g.total_rating)}/100` : '';
-            return `*${rankNum}. ${g.name}* (${dateStr}${ratingStr})\n🔗 https://sharkny-three.vercel.app/game/${g.id}`;
-        });
+            const link = `https://sharkny-three.vercel.app/game/${g.id}`;
+            const caption = `*${rankNum}. ${g.name}* (${year}${ratingStr})\n🔗 ${link}`;
 
-        const footer = (mode === 'popular' || mode === 'new') ? `\n\n📄 _Next page:_ \`!sharkny list game ${mode} ${page + 1}\`` : '';
-        return { text: header + lines.join('\n\n') + footer };
+            const imageUrl = g.cover?.image_id
+                ? `https://images.igdb.com/igdb/image/upload/t_cover_big/${g.cover.image_id}.jpg`
+                : null;
+
+            if (imageUrl) {
+                await sock.sendMessage(jid, { image: { url: imageUrl }, caption: caption });
+            } else {
+                await sock.sendMessage(jid, { text: caption });
+            }
+            await new Promise(r => setTimeout(r, 1200));
+        }
+
+        await sock.sendMessage(jid, { text: `📄 _Next page:_ \`!sharkny list game ${subArg.split(' ')[0]} ${page + 1}\`` });
     } catch (error) {
         console.error('IGDB List Error:', error);
-        return { text: '❌ Failed to fetch game list from IGDB.' };
+        await sock.sendMessage(jid, { text: '❌ Failed to fetch game list from IGDB.' });
     }
 }
 
@@ -300,14 +329,16 @@ async function searchTMDB(mediaType, rawQuery) {
     }
 }
 
-async function listTMDBMedia(mediaType, subArg) {
+async function listTMDBMedia(mediaType, subArg, sock, jid) {
     const tmdbToken = process.env.TMDB_ACCESS_TOKEN;
     if (!tmdbToken) {
-        return { text: '⚠️ TMDB access token is missing in your .env file.' };
+        await sock.sendMessage(jid, { text: '⚠️ TMDB access token is missing in your .env file.' });
+        return;
     }
 
     if (!subArg) {
-        return { text: `⚠️ Usage:\n• \`!sharkny list ${mediaType} popular [page]\`\n• \`!sharkny list ${mediaType} new [page]\`\n• \`!sharkny list ${mediaType} <query> [1-10]\`` };
+        await sock.sendMessage(jid, { text: `⚠️ Usage:\n• \`!sharkny list ${mediaType} popular [page]\`\n• \`!sharkny list ${mediaType} new [page]\`\n• \`!sharkny list ${mediaType} <query> [page]\`` });
+        return;
     }
 
     const parts = subArg.trim().split(/\s+/);
@@ -315,19 +346,18 @@ async function listTMDBMedia(mediaType, subArg) {
 
     let mode = 'search';
     let page = 1;
-    let count = 5;
     let queryTerm = '';
+    const pageSize = 5;
 
     if (firstToken === 'popular' || firstToken === 'new') {
         mode = firstToken;
-        count = 10;
         if (parts[1] && /^\d+$/.test(parts[1])) {
             page = Math.max(1, parseInt(parts[1], 10));
         }
     } else {
         const lastToken = parts[parts.length - 1];
         if (parts.length > 1 && /^\d+$/.test(lastToken)) {
-            count = Math.min(10, Math.max(1, parseInt(lastToken, 10)));
+            page = Math.max(1, parseInt(lastToken, 10));
             queryTerm = parts.slice(0, -1).join(' ');
         } else {
             queryTerm = subArg.trim();
@@ -335,51 +365,75 @@ async function listTMDBMedia(mediaType, subArg) {
     }
 
     const endpoint = mediaType === 'tv' ? 'tv' : 'movie';
-    let fetchUrl = '';
-
-    if (mode === 'popular') {
-        fetchUrl = `https://api.themoviedb.org/3/${endpoint}/popular?language=en-US&page=${page}`;
-    } else if (mode === 'new') {
-        fetchUrl = mediaType === 'tv'
-            ? `https://api.themoviedb.org/3/tv/on_the_air?language=en-US&page=${page}`
-            : `https://api.themoviedb.org/3/movie/now_playing?language=en-US&page=${page}`;
-    } else {
-        fetchUrl = `https://api.themoviedb.org/3/search/${endpoint}?query=${encodeURIComponent(queryTerm)}&include_adult=false&language=en-US&page=1`;
-    }
+    const typeTitle = mediaType === 'tv' ? 'TV Shows' : 'Movies';
 
     try {
-        const res = await fetch(fetchUrl, {
-            headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' }
-        });
-        const data = await res.json();
-        if (!data.results || data.results.length === 0) {
-            return { text: `❌ No results found for \`!sharkny list ${mediaType} ${subArg}\`.` };
+        let allResults = [];
+
+        if (mode === 'popular') {
+            // TMDB popular endpoints return 20 items per page. 
+            // Since our page size is 5, page 1 maps to TMDB page 1 items 1-5, etc.
+            const tmdbPage = Math.ceil((page * pageSize) / 20);
+            const fetchUrl = `https://api.themoviedb.org/3/${endpoint}/popular?language=en-US&page=${tmdbPage}`;
+            const res = await fetch(fetchUrl, { headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' } });
+            const data = await res.json();
+            const sliceIndex = ((page - 1) * pageSize) % 20;
+            allResults = (data.results || []).slice(sliceIndex, sliceIndex + pageSize);
+        } else if (mode === 'new') {
+            const tmdbPage = Math.ceil((page * pageSize) / 20);
+            const fetchUrl = mediaType === 'tv'
+                ? `https://api.themoviedb.org/3/tv/on_the_air?language=en-US&page=${tmdbPage}`
+                : `https://api.themoviedb.org/3/movie/now_playing?language=en-US&page=${tmdbPage}`;
+            const res = await fetch(fetchUrl, { headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' } });
+            const data = await res.json();
+            const sliceIndex = ((page - 1) * pageSize) % 20;
+            allResults = (data.results || []).slice(sliceIndex, sliceIndex + pageSize);
+        } else {
+            // Search mode
+            const fetchUrl = `https://api.themoviedb.org/3/search/${endpoint}?query=${encodeURIComponent(queryTerm)}&include_adult=false&language=en-US&page=1`;
+            const res = await fetch(fetchUrl, { headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' } });
+            const data = await res.json();
+            const ranked = rankTMDBResults(data.results || [], queryTerm);
+            const offset = (page - 1) * pageSize;
+            allResults = ranked.slice(offset, offset + pageSize);
         }
 
-        const results = mode === 'search'
-            ? rankTMDBResults(data.results, queryTerm).slice(0, count)
-            : data.results.slice(0, count);
+        if (allResults.length === 0) {
+            await sock.sendMessage(jid, { text: `❌ No results found on page ${page}.` });
+            return;
+        }
 
-        const typeTitle = mediaType === 'tv' ? 'TV Shows' : 'Movies';
         let header = '';
-        if (mode === 'popular') header = `🔥 *Popular ${typeTitle} (Page ${page})*\n\n`;
-        else if (mode === 'new') header = `🆕 *New / Airing ${typeTitle} (Page ${page})*\n\n`;
-        else header = `🎬 *Top ${results.length} ${typeTitle} for "${queryTerm}"*\n\n`;
+        if (mode === 'popular') header = `🔥 *Popular ${typeTitle} (Page ${page})*:\n`;
+        else if (mode === 'new') header = `🆕 *New / Airing ${typeTitle} (Page ${page})*:\n`;
+        else header = `🎬 *${typeTitle} for "${queryTerm}" (Page ${page})*:\n`;
 
-        const lines = results.map((item, idx) => {
-            const rankNum = mode === 'search' ? idx + 1 : ((page - 1) * count) + idx + 1;
+        await sock.sendMessage(jid, { text: header });
+
+        for (let idx = 0; idx < allResults.length; idx++) {
+            const item = allResults[idx];
+            const rankNum = ((page - 1) * pageSize) + idx + 1;
             const title = item.title || item.name || 'Unknown';
             const rawDate = item.release_date || item.first_air_date;
             const year = rawDate ? new Date(rawDate).getFullYear() : 'N/A';
             const rating = item.vote_average ? ` | ⭐ ${item.vote_average.toFixed(1)}/10` : '';
-            return `*${rankNum}. ${title}* (${year}${rating})\n🔗 https://sharkny-three.vercel.app/${endpoint}/${item.id}`;
-        });
+            const link = `https://sharkny-three.vercel.app/${endpoint}/${item.id}`;
+            const caption = `*${rankNum}. ${title}* (${year}${rating})\n🔗 ${link}`;
 
-        const footer = (mode === 'popular' || mode === 'new') ? `\n\n📄 _Next page:_ \`!sharkny list ${mediaType} ${mode} ${page + 1}\`` : '';
-        return { text: header + lines.join('\n\n') + footer };
+            const imageUrl = item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null;
+
+            if (imageUrl) {
+                await sock.sendMessage(jid, { image: { url: imageUrl }, caption: caption });
+            } else {
+                await sock.sendMessage(jid, { text: caption });
+            }
+            await new Promise(r => setTimeout(r, 1200));
+        }
+
+        await sock.sendMessage(jid, { text: `📄 _Next page:_ \`!sharkny list ${mediaType} ${subArg.split(' ')[0]} ${page + 1}\`` });
     } catch (error) {
         console.error('TMDB List Error:', error);
-        return { text: `❌ Failed to fetch ${mediaType} list from TMDB.` };
+        await sock.sendMessage(jid, { text: `❌ Failed to fetch ${mediaType} list from TMDB.` });
     }
 }
 
@@ -532,41 +586,39 @@ const commands = {
                 text: `🦈 *Sharkny Comprehensive Guide* 🦈\n\n` +
                       `**1. Single Lookups (with optional year parsing):**\n` +
                       `• \`!sharkny game <title> [year]\`\n` +
-                      `  _Example:_ \`!sharkny game god of war 2005\`\n` +
                       `• \`!sharkny movie <title> [year]\`\n` +
-                      `  _Example:_ \`!sharkny movie dune 2021\`\n` +
-                      `• \`!sharkny tv <title> [year]\`\n` +
-                      `  _Example:_ \`!sharkny tv daredevil 2015\`\n\n` +
-                      `**2. Lists & Pagination:**\n` +
-                      `• \`!sharkny list <game|movie|tv> popular [page]\`\n` +
-                      `  _Example:_ \`!sharkny list game popular 2\`\n` +
-                      `• \`!sharkny list <game|movie|tv> new [page]\`\n` +
-                      `  _Example:_ \`!sharkny list tv new\`\n` +
-                      `• \`!sharkny list <game|movie|tv> <query> [count]\`\n` +
-                      `  _Example:_ \`!sharkny list movie batman 8\`\n\n` +
+                      `• \`!sharkny tv <title> [year]\`\n\n` +
+                      `**2. 5-Item Lists & Pagination (with cover images):**\n` +
+                      `• \`!sharkny list game popular [page]\`\n` +
+                      `• \`!sharkny list movie new [page]\`\n` +
+                      `• \`!sharkny list tv <query> [page]\`\n\n` +
                       `🔗 *Main Platform:* https://sharkny-three.vercel.app`
             };
         }
 
         return {
             text: `🤖 *Sharkny Bot Command Center* 🤖\n\n` +
-                  `• \`!sharkny ...\` — Search games, movies, TV shows, or browse lists.\n` +
-                  `• \`!ai <prompt>\` — Chat with Gemini (supports replying to images & text context, with auto model failover).\n` +
-                  `• \`!deals\` — View all currently active 100% free games on Steam & Epic Games.\n` +
+                  `• \`!sharkny ...\` — Search single titles or browse 5-item paged lists.\n` +
+                  `• \`!ai <prompt>\` — Chat with Gemini (supports quoted image/text context).\n` +
+                  `• \`!deals\` — View active 100% free games on Steam & Epic Games.\n` +
                   `• \`!ping\` — Test bot response time.\n` +
-                  `• \`!help sharkny\` — Detailed documentation for Sharkny search & list features.\n\n` +
-                  `💡 _Tip: You can also quote any image or message when using \`!ai\` for analysis!_`
+                  `• \`!help sharkny\` — Detailed documentation for Sharkny search & lists.`
         };
     },
-    '!sharkny': async (args) => {
+    '!sharkny': async (args, msg, sock) => {
+        const jid = msg.key.remoteJid;
         if (!args) {
-            return {
-                text: '⚠️ Usage:\n• `!sharkny <game|tv|movie> <query> [year]`\n• `!sharkny list <game|tv|movie> <popular|new|query> [page/count]`\n• Type `!help sharkny` for full documentation.'
-            };
+            await sock.sendMessage(jid, {
+                text: '⚠️ Usage:\n• `!sharkny <game|tv|movie> <query> [year]`\n• `!sharkny list <game|tv|movie> <popular|new|query> [page]`\n• Type `!help sharkny` for full documentation.'
+            });
+            return;
         }
 
         const firstSpace = args.indexOf(' ');
-        if (firstSpace === -1) return { text: '⚠️ Please include a search query or subcommand. Type `!help sharkny` for details.' };
+        if (firstSpace === -1) {
+            await sock.sendMessage(jid, { text: '⚠️ Please include a search query or subcommand. Type `!help sharkny` for details.' });
+            return;
+        }
 
         const subCmd = args.slice(0, firstSpace).toLowerCase();
         const rest = args.slice(firstSpace + 1).trim();
@@ -576,9 +628,16 @@ const commands = {
             const listType = (secondSpace === -1 ? rest : rest.slice(0, secondSpace)).toLowerCase();
             const listArgs = secondSpace === -1 ? '' : rest.slice(secondSpace + 1).trim();
 
-            if (listType === 'game') return await listIGDBGames(listArgs);
-            if (listType === 'movie' || listType === 'tv') return await listTMDBMedia(listType, listArgs);
-            return { text: `❌ Unknown list type "${listType}". Use \`game\`, \`movie\`, or \`tv\`.` };
+            if (listType === 'game') {
+                await listIGDBGames(listArgs, sock, jid);
+                return;
+            }
+            if (listType === 'movie' || listType === 'tv') {
+                await listTMDBMedia(listType, listArgs, sock, jid);
+                return;
+            }
+            await sock.sendMessage(jid, { text: `❌ Unknown list type "${listType}". Use \`game\`, \`movie\`, or \`tv\`.` });
+            return;
         }
 
         if (subCmd === 'game') return await searchIGDB(rest);
