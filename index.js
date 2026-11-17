@@ -9,6 +9,8 @@ import { GoogleGenAI } from '@google/genai';
 // Initialize Gemini client (automatically reads process.env.GEMINI_API_KEY)
 const ai = new GoogleGenAI({});
 
+const USER_AGENT = 'Sharkny/1.0';
+
 // Ordered fallback list for Gemini models (handles 429 quota limits & 503 busy errors)
 const AI_MODELS = [
     'gemini-3.6-flash',
@@ -122,6 +124,7 @@ async function searchIGDB(rawQuery) {
                 'Client-ID': clientId,
                 'Authorization': `Bearer ${accessToken}`,
                 'Content-Type': 'text/plain',
+                'User-Agent': USER_AGENT
             },
             body: `search "${safeQuery}"; fields name, summary, total_rating, total_rating_count, hypes, first_release_date, cover.image_id, platforms.name, game_type, category, id; where version_parent = null; limit 20;`
         });
@@ -214,6 +217,7 @@ async function listIGDBGames(subArg, sock, jid) {
                 'Client-ID': clientId,
                 'Authorization': `Bearer ${accessToken}`,
                 'Content-Type': 'text/plain',
+                'User-Agent': USER_AGENT
             },
             body
         });
@@ -288,7 +292,7 @@ async function searchTMDB(mediaType, rawQuery) {
         }
 
         const searchRes = await fetch(searchUrl, {
-            headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' }
+            headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json', 'User-Agent': USER_AGENT }
         });
 
         const searchData = await searchRes.json();
@@ -301,7 +305,7 @@ async function searchTMDB(mediaType, rawQuery) {
         const runnersUp = ranked.slice(1, 3).map((r) => `${r.title || r.name}${r._year ? ` (${r._year})` : ''}`);
 
         const detailsRes = await fetch(`https://api.themoviedb.org/3/${endpoint}/${bestMatch.id}`, {
-            headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' }
+            headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json', 'User-Agent': USER_AGENT }
         });
 
         const item = await detailsRes.json();
@@ -379,7 +383,7 @@ async function listTMDBMedia(mediaType, subArg, sock, jid) {
         if (mode === 'popular') {
             const tmdbPage = Math.ceil((page * pageSize) / 20);
             const fetchUrl = `https://api.themoviedb.org/3/${endpoint}/popular?language=en-US&page=${tmdbPage}`;
-            const res = await fetch(fetchUrl, { headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' } });
+            const res = await fetch(fetchUrl, { headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json', 'User-Agent': USER_AGENT } });
             const data = await res.json();
             const sliceIndex = ((page - 1) * pageSize) % 20;
             allResults = (data.results || []).slice(sliceIndex, sliceIndex + pageSize);
@@ -388,13 +392,13 @@ async function listTMDBMedia(mediaType, subArg, sock, jid) {
             const fetchUrl = mediaType === 'tv'
                 ? `https://api.themoviedb.org/3/tv/on_the_air?language=en-US&page=${tmdbPage}`
                 : `https://api.themoviedb.org/3/movie/now_playing?language=en-US&page=${tmdbPage}`;
-            const res = await fetch(fetchUrl, { headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' } });
+            const res = await fetch(fetchUrl, { headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json', 'User-Agent': USER_AGENT } });
             const data = await res.json();
             const sliceIndex = ((page - 1) * pageSize) % 20;
             allResults = (data.results || []).slice(sliceIndex, sliceIndex + pageSize);
         } else {
             const fetchUrl = `https://api.themoviedb.org/3/search/${endpoint}?query=${encodeURIComponent(queryTerm)}&include_adult=false&language=en-US&page=1`;
-            const res = await fetch(fetchUrl, { headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' } });
+            const res = await fetch(fetchUrl, { headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json', 'User-Agent': USER_AGENT } });
             const data = await res.json();
             const ranked = rankTMDBResults(data.results || [], queryTerm);
             const offset = (page - 1) * pageSize;
@@ -493,12 +497,12 @@ async function handleAI(args, msg, sock) {
 }
 
 // ==========================================
-// 2. FREE GAMES & DEEP DISCOUNTS (CHEAPSHARK + STEAM)
+// 2. FREE GAMES & BEST DEALS (STEAM STOREFRONT + CHEAPSHARK)
 // ==========================================
 
 const SENT_DEALS_FILE = './sent_deals.json';
 const DISCOUNT_COOLDOWN_MS = 30 * 24 * 60 * 60 * 1000;
-const MIN_DISCOUNT_PERCENT = 70; // 70% and above
+const MIN_DISCOUNT_PERCENT = 50; // Allow strong 50%+ seasonal & AAA deals
 
 function getDealAlertTargets() {
     const targets = [];
@@ -560,7 +564,7 @@ async function getSteamUkrainePrices(appIds) {
     try {
         const res = await fetch(
             `https://store.steampowered.com/api/appdetails?appids=${appIds.join(',')}&cc=ua&filters=price_overview`,
-            { headers: { 'User-Agent': 'Sharkny/1.0' } }
+            { headers: { 'User-Agent': USER_AGENT } }
         );
         const data = await res.json();
 
@@ -580,69 +584,139 @@ async function getSteamUkrainePrices(appIds) {
     return uaMap;
 }
 
-// Fetch Steam 70%+ off deals reliably via CheapShark API (storeID=1 = Steam) + Steam UA pricing
-async function fetchSteamDiscounts() {
+// Combines Steam's Featured Categories (Summer/Autumn/Winter Sale spotlights & Top Sellers)
+// with CheapShark's most-reviewed Steam deals, ranked by popularity + discount quality.
+async function fetchBestSteamDeals() {
+    const candidates = new Map();
+    let activeEventName = null;
+
+    // Source A: Steam Official Featured Categories (catches seasonal sales, top sellers & specials)
     try {
-        // sortBy=Deal Rating ensures well-reviewed, real games appear at the top
-        const url = 'https://www.cheapshark.com/api/1.0/deals?storeID=1&onSale=1&sortBy=Deal%20Rating&pageSize=60';
-        const res = await fetch(url, { headers: { 'User-Agent': 'Sharkny/1.0' } });
-        const rawDeals = await res.json();
+        const steamCatRes = await fetch('https://store.steampowered.com/api/featuredcategories/?cc=us&l=english', {
+            headers: { 'User-Agent': USER_AGENT }
+        });
+        const catData = await steamCatRes.json();
 
-        if (!Array.isArray(rawDeals)) return [];
+        // Detect active seasonal/themed sale banner if Steam is running one
+        const possibleBanner = catData?.['0']?.name || catData?.specials?.name;
+        if (possibleBanner && /sale|fest|event|autumn|summer|winter|spring/i.test(possibleBanner)) {
+            activeEventName = possibleBanner;
+        }
 
-        const filtered = rawDeals
-            .filter(d => {
-                const savings = Math.round(parseFloat(d.savings || '0'));
-                return d.steamAppID && savings >= MIN_DISCOUNT_PERCENT && savings < 100;
-            })
-            .slice(0, 15);
+        const spotlightBuckets = [
+            ...(catData?.specials?.items || []),
+            ...(catData?.top_sellers?.items || [])
+        ];
 
-        if (filtered.length === 0) return [];
+        for (const item of spotlightBuckets) {
+            const discount = item.discount_percent || 0;
+            if (!item.id || !item.discounted || discount < 35 || discount >= 100) continue;
 
-        // Enrich with Ukrainian Store prices in one batch call
-        const appIds = filtered.map(d => d.steamAppID);
-        const uaPrices = await getSteamUkrainePrices(appIds);
-
-        return filtered.map(d => {
-            const appId = d.steamAppID;
-            const discount = Math.round(parseFloat(d.savings));
-            const ua = uaPrices[appId] || {};
-
-            // CheapShark provides lastChange timestamp (when the current discount started)
-            const startedDate = d.lastChange
-                ? new Date(d.lastChange * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+            const appId = String(item.id);
+            const endsDate = item.discount_expiration
+                ? new Date(item.discount_expiration * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
                 : null;
 
-            return {
+            candidates.set(appId, {
                 id: `steam_disc_${appId}`,
                 appId,
-                title: d.title,
+                title: item.name,
                 store: 'Steam',
                 discount,
-                originalPrice: `$${d.normalPrice}`,
-                finalPrice: `$${d.salePrice}`,
-                uaOriginalPrice: ua.original || null,
-                uaFinalPrice: ua.final || null,
-                steamRating: d.steamRatingPercent && d.steamRatingPercent !== '0' ? `${d.steamRatingPercent}% (${d.steamRatingText})` : null,
-                startedDate,
+                originalPrice: `$${(item.original_price / 100).toFixed(2)}`,
+                finalPrice: `$${(item.final_price / 100).toFixed(2)}`,
+                isSteamSpotlight: true,
+                reviewCount: 25000, // Spotlighted top-sellers are high-traffic hits
+                metacritic: 80,
+                startedDate: null,
+                endsDate,
                 link: `https://store.steampowered.com/app/${appId}`,
-                image: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`
-            };
-        });
+                image: item.large_capsule_image || item.header_image || `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`
+            });
+        }
     } catch (e) {
-        console.error('[Deals] CheapShark Steam discounts error:', e);
-        return [];
+        console.error('[Deals] Steam featuredcategories fetch error:', e);
     }
+
+    // Source B: CheapShark sorted by Review Count (surfaces big-name, heavily reviewed games on sale)
+    try {
+        const csUrl = 'https://www.cheapshark.com/api/1.0/deals?storeID=1&onSale=1&sortBy=Reviews&minimumReviewCount=3000&steamRating=75&pageSize=60';
+        const csRes = await fetch(csUrl, { headers: { 'User-Agent': USER_AGENT } });
+        const csDeals = await csRes.json();
+
+        if (Array.isArray(csDeals)) {
+            for (const d of csDeals) {
+                const discount = Math.round(parseFloat(d.savings || '0'));
+                if (!d.steamAppID || discount < MIN_DISCOUNT_PERCENT || discount >= 100) continue;
+
+                const appId = String(d.steamAppID);
+                const startedDate = d.lastChange
+                    ? new Date(d.lastChange * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+                    : null;
+
+                const existing = candidates.get(appId);
+                if (existing) {
+                    // Merge metadata if already found in Steam Spotlight
+                    existing.reviewCount = Math.max(existing.reviewCount, parseInt(d.steamRatingCount || '0', 10));
+                    existing.metacritic = Math.max(existing.metacritic, parseInt(d.metacriticScore || '0', 10));
+                    if (!existing.startedDate) existing.startedDate = startedDate;
+                } else {
+                    candidates.set(appId, {
+                        id: `steam_disc_${appId}`,
+                        appId,
+                        title: d.title,
+                        store: 'Steam',
+                        discount,
+                        originalPrice: `$${d.normalPrice}`,
+                        finalPrice: `$${d.salePrice}`,
+                        isSteamSpotlight: false,
+                        reviewCount: parseInt(d.steamRatingCount || '0', 10),
+                        metacritic: parseInt(d.metacriticScore || '0', 10),
+                        startedDate,
+                        endsDate: null,
+                        link: `https://store.steampowered.com/app/${appId}`,
+                        image: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`
+                    });
+                }
+            }
+        }
+    } catch (e) {
+        console.error('[Deals] CheapShark reviews-sorted fetch error:', e);
+    }
+
+    // Rank by overall deal quality: Discount % + Popularity (Review Count) + Metacritic + Steam Spotlight
+    const ranked = Array.from(candidates.values())
+        .map(game => {
+            const spotlightBonus = game.isSteamSpotlight ? 35 : 0;
+            const popularityBonus = Math.min(game.reviewCount / 2000, 45); // Up to +45 pts for blockbuster games
+            const criticBonus = game.metacritic >= 80 ? (game.metacritic - 75) : 0;
+            const score = game.discount + spotlightBonus + popularityBonus + criticBonus;
+            return { ...game, _rankScore: score };
+        })
+        .sort((a, b) => b._rankScore - a._rankScore)
+        .slice(0, 15);
+
+    if (ranked.length === 0) return { deals: [], eventName: activeEventName };
+
+    // Batch-fetch Ukrainian Store prices (UAH / ₴) for the top 15 ranked games
+    const uaPrices = await getSteamUkrainePrices(ranked.map(g => g.appId));
+    for (const game of ranked) {
+        const ua = uaPrices[game.appId];
+        game.uaOriginalPrice = ua?.original || null;
+        game.uaFinalPrice = ua?.final || null;
+    }
+
+    return { deals: ranked, eventName: activeEventName };
 }
 
 // Fetch 100% Free Games (Steam via CheapShark + Epic Games Store)
 async function fetchActiveFreebies() {
     let freebies = [];
 
-    // 1. Steam 100% Off via CheapShark (upperPrice=0 & onSale=1)
+    // 1. Steam 100% Off via CheapShark
     try {
         const res = await fetch('https://www.cheapshark.com/api/1.0/deals?storeID=1&onSale=1&upperPrice=0&pageSize=20', {
-            headers: { 'User-Agent': 'Mozilla/5.0' }
+            headers: { 'User-Agent': USER_AGENT }
         });
         const steamFree = await res.json();
         if (Array.isArray(steamFree)) {
@@ -668,7 +742,7 @@ async function fetchActiveFreebies() {
     // 2. Epic Games Store 100% Off
     try {
         const epicRes = await fetch('https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions?locale=en-US&country=US&allowCountries=US', {
-            headers: { 'User-Agent': 'Mozilla/5.0' }
+            headers: { 'User-Agent': USER_AGENT }
         });
         const epicData = await epicRes.json();
         const elements = epicData?.data?.Catalog?.searchStore?.elements || [];
@@ -698,17 +772,20 @@ async function fetchActiveFreebies() {
     return freebies;
 }
 
-// Formats all discounted games into a single clean WhatsApp list message
+// Formats all ranked deals into a single clean WhatsApp list message
 function formatDiscountListMessage(deals, headerTitle) {
     const lines = deals.map((d, idx) => {
         const uaPart = d.uaFinalPrice ? ` | 🇺🇦 *${d.uaFinalPrice}*` : '';
-        const datePart = d.startedDate ? ` _(Since ${d.startedDate})_` : '';
+        let datePart = '';
+        if (d.endsDate) datePart = ` _(Ends ${d.endsDate})_`;
+        else if (d.startedDate) datePart = ` _(Since ${d.startedDate})_`;
+
         return `*${idx + 1}. ${d.title}* — *-${d.discount}%*${datePart}\n` +
                `   🇺🇸 ~${d.originalPrice}~ → *${d.finalPrice}*${uaPart}\n` +
                `   🔗 ${d.link}`;
     });
 
-    return `${headerTitle}\n\n${lines.join('\n\n')}\n\n💡 _Tip: Type_ \`!discount <game name>\` _for full game overview, reviews & specs._`;
+    return `${headerTitle}\n\n${lines.join('\n\n')}\n\n💡 _Tip: Type_ \`!discount <game name>\` _for full overview, reviews & specs._`;
 }
 
 // Broadcasts a message or image card to all target chats with anti-spam intervals between each chat
@@ -750,15 +827,16 @@ async function checkAllDeals(sock) {
         }
     }
 
-    // 2. Check Deep Discounts (70%+) and send all newly detected deals in ONE consolidated list
-    const discounts = await fetchSteamDiscounts();
-    const newDiscounts = discounts.filter(d => shouldAlertDeal(dealsMap, d.id, d.discount));
+    // 2. Check Top Ranked Deals & Seasonal Events
+    const { deals, eventName } = await fetchBestSteamDeals();
+    const newDiscounts = deals.filter(d => shouldAlertDeal(dealsMap, d.id, d.discount));
 
     if (newDiscounts.length > 0) {
-        const listText = formatDiscountListMessage(
-            newDiscounts,
-            `🔥 *NEW STEAM DEEP DISCOUNTS (${MIN_DISCOUNT_PERCENT}%+ OFF)* 🔥`
-        );
+        const bannerTitle = eventName
+            ? `🎉 *STEAM ${eventName.toUpperCase()} — TOP DEALS* 🎉`
+            : `🔥 *TOP STEAM DEALS RIGHT NOW* 🔥`;
+
+        const listText = formatDiscountListMessage(newDiscounts, bannerTitle);
         await broadcastToTargets(sock, targets, { text: listText });
 
         for (const deal of newDiscounts) {
@@ -778,10 +856,9 @@ async function handleDiscountDetail(gameQuery, sock, jid) {
     await sock.sendMessage(jid, { text: `🔍 Checking Steam store & pricing for "${gameQuery}"...` });
 
     try {
-        // Search Steam store directly so any game works (even if <70% off)
         const searchRes = await fetch(
             `https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(gameQuery)}&l=english&cc=us`,
-            { headers: { 'User-Agent': 'Mozilla/5.0' } }
+            { headers: { 'User-Agent': USER_AGENT } }
         );
         const searchData = await searchRes.json();
         const firstHit = searchData?.items?.[0];
@@ -793,10 +870,9 @@ async function handleDiscountDetail(gameQuery, sock, jid) {
 
         const appId = firstHit.id;
 
-        // Fetch full US details + UA price in parallel
         const [usRes, uaRes] = await Promise.all([
-            fetch(`https://store.steampowered.com/api/appdetails?appids=${appId}&cc=us`, { headers: { 'User-Agent': 'Mozilla/5.0' } }),
-            fetch(`https://store.steampowered.com/api/appdetails?appids=${appId}&cc=ua&filters=price_overview`, { headers: { 'User-Agent': 'Mozilla/5.0' } })
+            fetch(`https://store.steampowered.com/api/appdetails?appids=${appId}&cc=us`, { headers: { 'User-Agent': USER_AGENT } }),
+            fetch(`https://store.steampowered.com/api/appdetails?appids=${appId}&cc=ua&filters=price_overview`, { headers: { 'User-Agent': USER_AGENT } })
         ]);
 
         const [usData, uaData] = await Promise.all([usRes.json(), uaRes.json()]);
@@ -878,7 +954,7 @@ const commands = {
                   `• \`!sharkny ...\` — Search single titles or browse 5-item paged lists.\n` +
                   `• \`!ai <prompt>\` — Chat with Gemini (supports quoted image/text context).\n` +
                   `• \`!deals free\` — View active 100% free games on Steam & Epic Games.\n` +
-                  `• \`!deals discount\` — List all active ${MIN_DISCOUNT_PERCENT}%+ off Steam deals (USD & UAH).\n` +
+                  `• \`!deals discount\` — Top-ranked Steam deals & seasonal sale highlights (USD & UAH).\n` +
                   `• \`!discount <gamename>\` — Get detailed price, discount & game info for any Steam game.\n` +
                   `• \`!ping\` — Test bot response time.\n` +
                   `• \`!help sharkny\` — Detailed documentation for Sharkny search & lists.`
@@ -928,7 +1004,7 @@ const commands = {
     '!discount': async (args, msg, sock) => {
         const jid = msg.key.remoteJid;
         if (!args) {
-            await sock.sendMessage(jid, { text: '⚠️ Usage: `!discount <gamename>` (e.g. `!discount skyrim`)' });
+            await sock.sendMessage(jid, { text: '⚠️ Usage: `!discount <gamename>` (e.g. `!discount persona 5 royal`)' });
             return;
         }
         await handleDiscountDetail(args.trim(), sock, jid);
@@ -958,20 +1034,21 @@ const commands = {
         }
 
         if (subCmd === 'discount' || subCmd === 'discounts') {
-            await sock.sendMessage(jid, { text: `🔍 Fetching active ${MIN_DISCOUNT_PERCENT}%+ off Steam discounts (US & Ukraine stores)...` });
-            const discounts = await fetchSteamDiscounts();
-            if (discounts.length === 0) {
-                return { text: `ℹ️ No ${MIN_DISCOUNT_PERCENT}%+ off Steam discounts found right now.` };
+            await sock.sendMessage(jid, { text: '🔍 Fetching top-ranked Steam deals & seasonal sale highlights (US & Ukraine stores)...' });
+            const { deals, eventName } = await fetchBestSteamDeals();
+            if (deals.length === 0) {
+                return { text: 'ℹ️ No major Steam discounts found right now.' };
             }
 
-            const listText = formatDiscountListMessage(
-                discounts,
-                `🔥 *ACTIVE STEAM DISCOUNTS (${MIN_DISCOUNT_PERCENT}%+ OFF)* 🔥`
-            );
+            const headerTitle = eventName
+                ? `🎉 *STEAM ${eventName.toUpperCase()} — TOP DEALS* 🎉`
+                : `🔥 *TOP STEAM DEALS RIGHT NOW* 🔥`;
+
+            const listText = formatDiscountListMessage(deals, headerTitle);
             return { text: listText };
         }
 
-        return { text: '⚠️ Usage:\n• `!deals free` — Active 100% free games\n• `!deals discount` — List all active 70%+ off Steam deals\n• `!discount <gamename>` — Detailed info for any Steam game' };
+        return { text: '⚠️ Usage:\n• `!deals free` — Active 100% free games\n• `!deals discount` — Top-ranked Steam deals & seasonal sales\n• `!discount <gamename>` — Detailed info for any Steam game' };
     }
 };
 
