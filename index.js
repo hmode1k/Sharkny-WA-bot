@@ -197,7 +197,6 @@ async function listIGDBGames(subArg, sock, jid) {
         body = `fields name, total_rating, first_release_date, cover.image_id, id; where version_parent = null & cover != null & first_release_date >= ${thirtyDaysAgoSec} & first_release_date <= ${nowSec}; sort first_release_date desc; limit ${pageSize}; offset ${offset};`;
     } else {
         const safeQuery = queryTerm.replace(/"/g, '\\"');
-        // Fetch enough results to support pagination across ranked items
         const fetchLimit = Math.max(20, page * pageSize);
         body = `search "${safeQuery}"; fields name, total_rating, total_rating_count, hypes, first_release_date, cover.image_id, game_type, category, id; where version_parent = null; limit ${fetchLimit};`;
     }
@@ -259,7 +258,8 @@ async function listIGDBGames(subArg, sock, jid) {
             await new Promise(r => setTimeout(r, 1200));
         }
 
-        await sock.sendMessage(jid, { text: `📄 _Next page:_ \`!sharkny list game ${subArg.split(' ')[0]} ${page + 1}\`` });
+        const baseCmd = mode === 'search' ? queryTerm : mode;
+        await sock.sendMessage(jid, { text: `📄 _Next page:_ \`!sharkny list game ${baseCmd} ${page + 1}\`` });
     } catch (error) {
         console.error('IGDB List Error:', error);
         await sock.sendMessage(jid, { text: '❌ Failed to fetch game list from IGDB.' });
@@ -371,8 +371,6 @@ async function listTMDBMedia(mediaType, subArg, sock, jid) {
         let allResults = [];
 
         if (mode === 'popular') {
-            // TMDB popular endpoints return 20 items per page. 
-            // Since our page size is 5, page 1 maps to TMDB page 1 items 1-5, etc.
             const tmdbPage = Math.ceil((page * pageSize) / 20);
             const fetchUrl = `https://api.themoviedb.org/3/${endpoint}/popular?language=en-US&page=${tmdbPage}`;
             const res = await fetch(fetchUrl, { headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' } });
@@ -389,7 +387,6 @@ async function listTMDBMedia(mediaType, subArg, sock, jid) {
             const sliceIndex = ((page - 1) * pageSize) % 20;
             allResults = (data.results || []).slice(sliceIndex, sliceIndex + pageSize);
         } else {
-            // Search mode
             const fetchUrl = `https://api.themoviedb.org/3/search/${endpoint}?query=${encodeURIComponent(queryTerm)}&include_adult=false&language=en-US&page=1`;
             const res = await fetch(fetchUrl, { headers: { 'Authorization': `Bearer ${tmdbToken}`, 'Accept': 'application/json' } });
             const data = await res.json();
@@ -430,7 +427,8 @@ async function listTMDBMedia(mediaType, subArg, sock, jid) {
             await new Promise(r => setTimeout(r, 1200));
         }
 
-        await sock.sendMessage(jid, { text: `📄 _Next page:_ \`!sharkny list ${mediaType} ${subArg.split(' ')[0]} ${page + 1}\`` });
+        const baseCmd = mode === 'search' ? queryTerm : mode;
+        await sock.sendMessage(jid, { text: `📄 _Next page:_ \`!sharkny list ${mediaType} ${baseCmd} ${page + 1}\`` });
     } catch (error) {
         console.error('TMDB List Error:', error);
         await sock.sendMessage(jid, { text: `❌ Failed to fetch ${mediaType} list from TMDB.` });
@@ -470,14 +468,12 @@ async function handleAI(args, msg, sock) {
     contents.push(textPrompt);
     await sock.sendPresenceUpdate('composing', jid);
 
-    let lastError = null;
     try {
         for (const modelName of AI_MODELS) {
             try {
                 const response = await ai.models.generateContent({ model: modelName, contents: contents });
                 return { text: response.text || '🤖 Gemini generated an empty response.' };
             } catch (error) {
-                lastError = error;
                 const status = error?.status || '';
                 const msgText = error?.message || '';
                 if (status === 429 || status === 503 || msgText.includes('429') || msgText.includes('503')) continue;
@@ -491,28 +487,64 @@ async function handleAI(args, msg, sock) {
 }
 
 // ==========================================
-// 2. FREE GAMES FETCHER & DEALS MONITOR
+// 2. FREE GAMES & DEEP DISCOUNTS MONITOR
 // ==========================================
 
 const SENT_DEALS_FILE = './sent_deals.json';
+// Cooldown in ms before re-alerting the same game for a brand-new sale event (30 days)
+const DISCOUNT_COOLDOWN_MS = 30 * 24 * 60 * 60 * 1000;
+// Minimum discount percentage to alert for paid sales (e.g., 80%)
+const MIN_DISCOUNT_PERCENT = 80;
 
-function getSentDeals() {
+function getSentDealsMap() {
     try {
-        if (fs.existsSync(SENT_DEALS_FILE)) return JSON.parse(fs.readFileSync(SENT_DEALS_FILE, 'utf8'));
-    } catch (e) {}
-    return [];
-}
-
-function saveSentDeal(dealKey) {
-    const deals = getSentDeals();
-    if (!deals.includes(dealKey)) {
-        deals.push(dealKey);
-        fs.writeFileSync(SENT_DEALS_FILE, JSON.stringify(deals, null, 2));
+        if (fs.existsSync(SENT_DEALS_FILE)) {
+            const parsed = JSON.parse(fs.readFileSync(SENT_DEALS_FILE, 'utf8'));
+            // Auto-migrate legacy array format ["steam_123"] into timestamped map
+            if (Array.isArray(parsed)) {
+                const migrated = {};
+                for (const key of parsed) {
+                    migrated[key] = { timestamp: Date.now(), discount: 100 };
+                }
+                fs.writeFileSync(SENT_DEALS_FILE, JSON.stringify(migrated, null, 2));
+                return migrated;
+            }
+            return parsed;
+        }
+    } catch (e) {
+        console.error('Error reading sent_deals.json:', e);
     }
+    return {};
 }
 
-async function fetchActiveDeals() {
-    let dealsList = [];
+function saveSentDeal(dealKey, discountPercent) {
+    const dealsMap = getSentDealsMap();
+    dealsMap[dealKey] = {
+        timestamp: Date.now(),
+        discount: discountPercent
+    };
+    fs.writeFileSync(SENT_DEALS_FILE, JSON.stringify(dealsMap, null, 2));
+}
+
+function shouldAlertDeal(dealsMap, dealKey, currentDiscount) {
+    const record = dealsMap[dealKey];
+    if (!record) return true; // Never notified before
+
+    const elapsed = Date.now() - (record.timestamp || 0);
+    // Re-notify if the previous sale was over 30 days ago (new sale cycle)
+    if (elapsed >= DISCOUNT_COOLDOWN_MS) return true;
+
+    // Also re-notify if the discount became even deeper during the active window (e.g., 80% -> 90%)
+    if (currentDiscount > (record.discount || 0)) return true;
+
+    return false;
+}
+
+// Fetch 100% Free Games (Steam & Epic)
+async function fetchActiveFreebies() {
+    let freebies = [];
+
+    // Steam 100% Off
     try {
         const steamRes = await fetch('https://store.steampowered.com/search/results/?query&start=0&count=15&maxprice=free&category1=998&specials=1&json=1', {
             headers: { 'User-Agent': 'Mozilla/5.0' }
@@ -521,12 +553,24 @@ async function fetchActiveDeals() {
         if (steamData?.results) {
             for (const item of steamData.results) {
                 if (item.price?.discount_percent === 100) {
-                    dealsList.push({ id: `steam_${item.id}`, title: item.name, store: 'Steam', originalPrice: item.price?.original_formatted || 'Paid', link: item.url, image: item.logo || null });
+                    freebies.push({
+                        id: `steam_free_${item.id}`,
+                        title: item.name,
+                        store: 'Steam',
+                        discount: 100,
+                        originalPrice: item.price?.original_formatted || 'Paid',
+                        finalPrice: 'FREE',
+                        link: item.url,
+                        image: item.logo || null
+                    });
                 }
             }
         }
-    } catch (e) {}
+    } catch (e) {
+        console.error('[Deals] Steam freebies fetch error:', e);
+    }
 
+    // Epic Games 100% Off
     try {
         const epicRes = await fetch('https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions?locale=en-US&country=US&allowCountries=US', {
             headers: { 'User-Agent': 'Mozilla/5.0' }
@@ -540,37 +584,101 @@ async function fetchActiveDeals() {
                 const slug = game.catalogNs?.mappings?.[0]?.pageSlug || game.productSlug || game.urlSlug;
                 const storeLink = slug ? `https://store.epicgames.com/en-US/p/${slug}` : 'https://store.epicgames.com/en-US/free-games';
                 const imageObj = game.keyImages?.find(img => img.type === 'OfferImageWide') || game.keyImages?.[0];
-                dealsList.push({ id: `epic_${game.id}`, title: game.title, store: 'Epic Games Store', originalPrice: game.price?.totalPrice?.fmtPrice?.originalPrice || 'Paid', link: storeLink, image: imageObj?.url || null });
+                freebies.push({
+                    id: `epic_free_${game.id}`,
+                    title: game.title,
+                    store: 'Epic Games Store',
+                    discount: 100,
+                    originalPrice: game.price?.totalPrice?.fmtPrice?.originalPrice || 'Paid',
+                    finalPrice: 'FREE',
+                    link: storeLink,
+                    image: imageObj?.url || null
+                });
             }
         }
-    } catch (e) {}
+    } catch (e) {
+        console.error('[Deals] Epic freebies fetch error:', e);
+    }
 
-    return dealsList;
+    return freebies;
 }
 
-async function checkFreeGames(sock) {
+// Fetch Steep Discounts (80% - 99% Off on Steam Specials)
+async function fetchActiveDiscounts() {
+    let discounts = [];
+
+    try {
+        // Query top Steam specials (sorted by Steam's relevance/featured weight so major titles like Skyrim appear first)
+        const steamRes = await fetch('https://store.steampowered.com/search/results/?query&start=0&count=50&category1=998&specials=1&json=1', {
+            headers: { 'User-Agent': 'Mozilla/5.0' }
+        });
+        const steamData = await steamRes.json();
+
+        if (steamData?.results) {
+            for (const item of steamData.results) {
+                const pct = item.price?.discount_percent || 0;
+                if (pct >= MIN_DISCOUNT_PERCENT && pct < 100) {
+                    discounts.push({
+                        id: `steam_disc_${item.id}`,
+                        title: item.name,
+                        store: 'Steam',
+                        discount: pct,
+                        originalPrice: item.price?.original_formatted || 'N/A',
+                        finalPrice: item.price?.final_formatted || 'Discounted',
+                        link: item.url,
+                        image: item.logo || null
+                    });
+                }
+            }
+        }
+    } catch (e) {
+        console.error('[Deals] Steam discounts fetch error:', e);
+    }
+
+    // Sort highest discount first, capped at top 10
+    return discounts.sort((a, b) => b.discount - a.discount).slice(0, 10);
+}
+
+async function checkAllDeals(sock) {
     const targetJid = process.env.ALERT_TARGET_JID;
     if (!targetJid) return;
-    const sentDeals = getSentDeals();
-    const activeDeals = await fetchActiveDeals();
 
-    for (const deal of activeDeals) {
-        if (!sentDeals.includes(deal.id)) {
+    const dealsMap = getSentDealsMap();
+
+    // 1. Check 100% Freebies
+    const freebies = await fetchActiveFreebies();
+    for (const deal of freebies) {
+        if (shouldAlertDeal(dealsMap, deal.id, deal.discount)) {
             const messageText = `🚨 *FREE ${deal.store.toUpperCase()} ALERT!* 🚨\n\n🎮 *${deal.title}*\n🏷️ *Normal Price:* ~${deal.originalPrice}~\n💸 *Now:* *100% FREE!*\n\n🔗 *Store Link:* ${deal.link}`;
             if (deal.image) {
                 await sock.sendMessage(targetJid, { image: { url: deal.image }, caption: messageText });
             } else {
                 await sock.sendMessage(targetJid, { text: messageText });
             }
-            saveSentDeal(deal.id);
+            saveSentDeal(deal.id, deal.discount);
+            await new Promise(r => setTimeout(r, 3000));
+        }
+    }
+
+    // 2. Check Deep Discounts (80%+)
+    const discounts = await fetchActiveDiscounts();
+    for (const deal of discounts) {
+        if (shouldAlertDeal(dealsMap, deal.id, deal.discount)) {
+            const messageText = `🔥 *${deal.discount}% OFF STEAM DEAL!* 🔥\n\n🎮 *${deal.title}*\n🏷️ *Original:* ~${deal.originalPrice}~\n💰 *Sale Price:* *${deal.finalPrice}* (-${deal.discount}%)\n\n🔗 *Store Link:* ${deal.link}`;
+            if (deal.image) {
+                await sock.sendMessage(targetJid, { image: { url: deal.image }, caption: messageText });
+            } else {
+                await sock.sendMessage(targetJid, { text: messageText });
+            }
+            saveSentDeal(deal.id, deal.discount);
             await new Promise(r => setTimeout(r, 3000));
         }
     }
 }
 
 function startDealsMonitor(sock) {
-    checkFreeGames(sock);
-    setInterval(() => checkFreeGames(sock), 3 * 60 * 60 * 1000);
+    checkAllDeals(sock);
+    setInterval(() => checkAllDeals(sock), 3 * 60 * 60 * 1000);
 }
 
 // ==========================================
@@ -584,11 +692,11 @@ const commands = {
         if (query === 'sharkny') {
             return {
                 text: `🦈 *Sharkny Comprehensive Guide* 🦈\n\n` +
-                      `**1. Single Lookups (with optional year parsing):**\n` +
+                      `*1. Single Lookups (with optional year parsing):*\n` +
                       `• \`!sharkny game <title> [year]\`\n` +
                       `• \`!sharkny movie <title> [year]\`\n` +
                       `• \`!sharkny tv <title> [year]\`\n\n` +
-                      `**2. 5-Item Lists & Pagination (with cover images):**\n` +
+                      `*2. 5-Item Lists & Pagination (with cover images):*\n` +
                       `• \`!sharkny list game popular [page]\`\n` +
                       `• \`!sharkny list movie new [page]\`\n` +
                       `• \`!sharkny list tv <query> [page]\`\n\n` +
@@ -600,7 +708,8 @@ const commands = {
             text: `🤖 *Sharkny Bot Command Center* 🤖\n\n` +
                   `• \`!sharkny ...\` — Search single titles or browse 5-item paged lists.\n` +
                   `• \`!ai <prompt>\` — Chat with Gemini (supports quoted image/text context).\n` +
-                  `• \`!deals\` — View active 100% free games on Steam & Epic Games.\n` +
+                  `• \`!deals free\` — View active 100% free games on Steam & Epic Games.\n` +
+                  `• \`!deals discount\` — View active ${MIN_DISCOUNT_PERCENT}%+ off deep discounts on Steam.\n` +
                   `• \`!ping\` — Test bot response time.\n` +
                   `• \`!help sharkny\` — Detailed documentation for Sharkny search & lists.`
         };
@@ -648,20 +757,49 @@ const commands = {
     '!ping': async () => ({ text: 'Pong! 🏓' }),
     '!deals': async (args, msg, sock) => {
         const jid = msg.key.remoteJid;
-        await sock.sendMessage(jid, { text: '🔍 Scanning Steam and Epic Games for currently active 100% free deals...' });
-        const deals = await fetchActiveDeals();
-        if (deals.length === 0) return { text: 'ℹ️ There are currently no active 100% free game promotions running.' };
+        const subCmd = (args || 'free').trim().toLowerCase();
 
-        await sock.sendMessage(jid, { text: `🎯 Found *${deals.length}* active free game deal(s) right now:` });
-        for (const deal of deals) {
-            const cardText = `🎮 *${deal.title}* (${deal.store})\n🏷️ *Normal Price:* ~${deal.originalPrice}~\n💸 *Price:* *100% FREE*\n\n🔗 *Store Link:* ${deal.link}`;
-            if (deal.image) {
-                await sock.sendMessage(jid, { image: { url: deal.image }, caption: cardText });
-            } else {
-                await sock.sendMessage(jid, { text: cardText });
+        if (subCmd === 'free') {
+            await sock.sendMessage(jid, { text: '🔍 Scanning Steam and Epic Games for active 100% free games...' });
+            const freebies = await fetchActiveFreebies();
+            if (freebies.length === 0) {
+                return { text: 'ℹ️ There are currently no active 100% free game promotions running.' };
             }
-            await new Promise(r => setTimeout(r, 1500));
+
+            await sock.sendMessage(jid, { text: `🎯 Found *${freebies.length}* active free game(s) right now:` });
+            for (const deal of freebies) {
+                const cardText = `🎮 *${deal.title}* (${deal.store})\n🏷️ *Normal Price:* ~${deal.originalPrice}~\n💸 *Price:* *100% FREE*\n\n🔗 *Store Link:* ${deal.link}`;
+                if (deal.image) {
+                    await sock.sendMessage(jid, { image: { url: deal.image }, caption: cardText });
+                } else {
+                    await sock.sendMessage(jid, { text: cardText });
+                }
+                await new Promise(r => setTimeout(r, 1500));
+            }
+            return;
         }
+
+        if (subCmd === 'discount' || subCmd === 'discounts') {
+            await sock.sendMessage(jid, { text: `🔍 Scanning Steam for top ${MIN_DISCOUNT_PERCENT}%+ off discounts...` });
+            const discounts = await fetchActiveDiscounts();
+            if (discounts.length === 0) {
+                return { text: `ℹ️ No featured ${MIN_DISCOUNT_PERCENT}%+ off Steam discounts found right now.` };
+            }
+
+            await sock.sendMessage(jid, { text: `🔥 Found *${discounts.length}* deep discount deal(s) (${MIN_DISCOUNT_PERCENT}%+ off):` });
+            for (const deal of discounts) {
+                const cardText = `🎮 *${deal.title}* (${deal.store})\n🏷️ *Original:* ~${deal.originalPrice}~\n💰 *Now:* *${deal.finalPrice}* (-${deal.discount}%)\n\n🔗 *Store Link:* ${deal.link}`;
+                if (deal.image) {
+                    await sock.sendMessage(jid, { image: { url: deal.image }, caption: cardText });
+                } else {
+                    await sock.sendMessage(jid, { text: cardText });
+                }
+                await new Promise(r => setTimeout(r, 1500));
+            }
+            return;
+        }
+
+        return { text: '⚠️ Usage:\n• `!deals free` — Active 100% free games\n• `!deals discount` — Active 80%+ off Steam deals' };
     }
 };
 
