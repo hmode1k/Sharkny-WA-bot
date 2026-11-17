@@ -17,6 +17,12 @@ const AI_MODELS = [
     'gemini-2.5-flash'
 ];
 
+// Helper for human-like anti-spam delays (random jitter between minMs and maxMs)
+function sleepJitter(minMs, maxMs) {
+    const delay = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+    return new Promise(resolve => setTimeout(resolve, delay));
+}
+
 // ==========================================
 // 1. SEARCH & RANKING HELPERS (IGDB, TMDB, GEMINI)
 // ==========================================
@@ -494,6 +500,19 @@ const SENT_DEALS_FILE = './sent_deals.json';
 const DISCOUNT_COOLDOWN_MS = 30 * 24 * 60 * 60 * 1000;
 const MIN_DISCOUNT_PERCENT = 80;
 
+// Build deduplicated target list: group chat from .env + private LID chat
+function getDealAlertTargets() {
+    const targets = [];
+    if (process.env.ALERT_TARGET_JID) {
+        targets.push(process.env.ALERT_TARGET_JID.trim());
+    }
+    const extraPrivateLid = '269844725379109@lid';
+    if (!targets.includes(extraPrivateLid)) {
+        targets.push(extraPrivateLid);
+    }
+    return targets;
+}
+
 function getSentDealsMap() {
     try {
         if (fs.existsSync(SENT_DEALS_FILE)) {
@@ -583,7 +602,6 @@ function formatPriceLines(deal) {
 async function fetchActiveFreebies() {
     let freebies = [];
 
-    // Steam 100% Off (US Store)
     try {
         const steamRes = await fetch('https://store.steampowered.com/search/results/?query&start=0&count=15&maxprice=free&category1=998&specials=1&cc=us&json=1', {
             headers: { 'User-Agent': 'Mozilla/5.0' }
@@ -612,7 +630,6 @@ async function fetchActiveFreebies() {
         console.error('[Deals] Steam freebies fetch error:', e);
     }
 
-    // Epic Games 100% Off
     try {
         const epicRes = await fetch('https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions?locale=en-US&country=US&allowCountries=US', {
             headers: { 'User-Agent': 'Mozilla/5.0' }
@@ -690,9 +707,31 @@ async function fetchActiveDiscounts() {
     return discounts;
 }
 
+// Broadcasts a single deal to all target chats with anti-spam intervals between each chat
+async function broadcastDealToTargets(sock, targets, deal, messageText) {
+    for (let i = 0; i < targets.length; i++) {
+        const targetJid = targets[i];
+        try {
+            if (deal.image) {
+                await sock.sendMessage(targetJid, { image: { url: deal.image }, caption: messageText });
+            } else {
+                await sock.sendMessage(targetJid, { text: messageText });
+            }
+            console.log(`[Deals Monitor] Sent "${deal.title}" to ${targetJid}`);
+        } catch (err) {
+            console.error(`[Deals Monitor] Failed sending "${deal.title}" to ${targetJid}:`, err);
+        }
+
+        // Wait 4 to 6 seconds between sending to the group chat and the private chat
+        if (i < targets.length - 1) {
+            await sleepJitter(4000, 6000);
+        }
+    }
+}
+
 async function checkAllDeals(sock) {
-    const targetJid = process.env.ALERT_TARGET_JID;
-    if (!targetJid) return;
+    const targets = getDealAlertTargets();
+    if (targets.length === 0) return;
 
     const dealsMap = getSentDealsMap();
 
@@ -701,13 +740,11 @@ async function checkAllDeals(sock) {
     for (const deal of freebies) {
         if (shouldAlertDeal(dealsMap, deal.id, deal.discount)) {
             const messageText = `🚨 *FREE ${deal.store.toUpperCase()} ALERT!* 🚨\n\n🎮 *${deal.title}*\n${formatPriceLines(deal)}\n\n🔗 *Store Link:* ${deal.link}`;
-            if (deal.image) {
-                await sock.sendMessage(targetJid, { image: { url: deal.image }, caption: messageText });
-            } else {
-                await sock.sendMessage(targetJid, { text: messageText });
-            }
+            await broadcastDealToTargets(sock, targets, deal, messageText);
             saveSentDeal(deal.id, deal.discount);
-            await new Promise(r => setTimeout(r, 3000));
+
+            // Wait 8 to 12 seconds before sending the next deal
+            await sleepJitter(8000, 12000);
         }
     }
 
@@ -716,13 +753,11 @@ async function checkAllDeals(sock) {
     for (const deal of discounts) {
         if (shouldAlertDeal(dealsMap, deal.id, deal.discount)) {
             const messageText = `🔥 *${deal.discount}% OFF STEAM DEAL!* 🔥\n\n🎮 *${deal.title}*\n${formatPriceLines(deal)}\n\n🔗 *Store Link:* ${deal.link}`;
-            if (deal.image) {
-                await sock.sendMessage(targetJid, { image: { url: deal.image }, caption: messageText });
-            } else {
-                await sock.sendMessage(targetJid, { text: messageText });
-            }
+            await broadcastDealToTargets(sock, targets, deal, messageText);
             saveSentDeal(deal.id, deal.discount);
-            await new Promise(r => setTimeout(r, 3000));
+
+            // Wait 8 to 12 seconds before sending the next deal
+            await sleepJitter(8000, 12000);
         }
     }
 }
@@ -730,6 +765,7 @@ async function checkAllDeals(sock) {
 function startDealsMonitor(sock) {
     checkAllDeals(sock);
     setInterval(() => checkAllDeals(sock), 3 * 60 * 60 * 1000);
+    console.log(`[Deals Monitor] Active for targets: ${getDealAlertTargets().join(', ')}`);
 }
 
 // ==========================================
@@ -825,7 +861,7 @@ const commands = {
                 } else {
                     await sock.sendMessage(jid, { text: cardText });
                 }
-                await new Promise(r => setTimeout(r, 1500));
+                await sleepJitter(2000, 3000);
             }
             return;
         }
@@ -845,7 +881,7 @@ const commands = {
                 } else {
                     await sock.sendMessage(jid, { text: cardText });
                 }
-                await new Promise(r => setTimeout(r, 1500));
+                await sleepJitter(2000, 3000);
             }
             return;
         }
