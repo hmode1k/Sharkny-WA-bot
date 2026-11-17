@@ -560,7 +560,7 @@ async function getSteamUkrainePrices(appIds) {
     try {
         const res = await fetch(
             `https://store.steampowered.com/api/appdetails?appids=${appIds.join(',')}&cc=ua&filters=price_overview`,
-            { headers: { 'User-Agent': 'Mozilla/5.0' } }
+            { headers: { 'User-Agent': 'Sharkny/1.0' } }
         );
         const data = await res.json();
 
