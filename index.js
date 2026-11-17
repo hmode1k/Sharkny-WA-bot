@@ -491,16 +491,13 @@ async function handleAI(args, msg, sock) {
 // ==========================================
 
 const SENT_DEALS_FILE = './sent_deals.json';
-// Cooldown in ms before re-alerting the same game for a brand-new sale event (30 days)
 const DISCOUNT_COOLDOWN_MS = 30 * 24 * 60 * 60 * 1000;
-// Minimum discount percentage to alert for paid sales (e.g., 80%)
 const MIN_DISCOUNT_PERCENT = 80;
 
 function getSentDealsMap() {
     try {
         if (fs.existsSync(SENT_DEALS_FILE)) {
             const parsed = JSON.parse(fs.readFileSync(SENT_DEALS_FILE, 'utf8'));
-            // Auto-migrate legacy array format ["steam_123"] into timestamped map
             if (Array.isArray(parsed)) {
                 const migrated = {};
                 for (const key of parsed) {
@@ -528,42 +525,87 @@ function saveSentDeal(dealKey, discountPercent) {
 
 function shouldAlertDeal(dealsMap, dealKey, currentDiscount) {
     const record = dealsMap[dealKey];
-    if (!record) return true; // Never notified before
+    if (!record) return true;
 
     const elapsed = Date.now() - (record.timestamp || 0);
-    // Re-notify if the previous sale was over 30 days ago (new sale cycle)
     if (elapsed >= DISCOUNT_COOLDOWN_MS) return true;
-
-    // Also re-notify if the discount became even deeper during the active window (e.g., 80% -> 90%)
     if (currentDiscount > (record.discount || 0)) return true;
 
     return false;
+}
+
+// Batch-fetch Ukrainian Store prices (UAH / ₴) for a list of Steam App IDs
+async function getSteamUkrainePrices(appIds) {
+    const uaMap = {};
+    if (!appIds || appIds.length === 0) return uaMap;
+
+    try {
+        const res = await fetch(
+            `https://store.steampowered.com/api/appdetails?appids=${appIds.join(',')}&cc=ua&filters=price_overview`,
+            { headers: { 'User-Agent': 'Mozilla/5.0' } }
+        );
+        const data = await res.json();
+
+        for (const id of appIds) {
+            const po = data?.[id]?.data?.price_overview;
+            if (po) {
+                uaMap[id] = {
+                    original: po.initial_formatted || po.final_formatted || null,
+                    final: po.final_formatted || null
+                };
+            }
+        }
+    } catch (e) {
+        console.error('[Deals] Steam Ukraine price lookup error:', e);
+    }
+
+    return uaMap;
+}
+
+function formatPriceLines(deal) {
+    if (deal.discount === 100) {
+        let lines = `🇺🇸 *US Store:* ~${deal.originalPrice}~ → *100% FREE*`;
+        if (deal.uaOriginalPrice) {
+            lines += `\n🇺🇦 *UA Store:* ~${deal.uaOriginalPrice}~ → *100% FREE*`;
+        }
+        return lines;
+    }
+
+    let lines = `🇺🇸 *US Store:* ~${deal.originalPrice}~ → *${deal.finalPrice}* (-${deal.discount}%)`;
+    if (deal.uaFinalPrice) {
+        const uaOrig = deal.uaOriginalPrice ? `~${deal.uaOriginalPrice}~ → ` : '';
+        lines += `\n🇺🇦 *UA Store:* ${uaOrig}*${deal.uaFinalPrice}*`;
+    }
+    return lines;
 }
 
 // Fetch 100% Free Games (Steam & Epic)
 async function fetchActiveFreebies() {
     let freebies = [];
 
-    // Steam 100% Off
+    // Steam 100% Off (US Store)
     try {
-        const steamRes = await fetch('https://store.steampowered.com/search/results/?query&start=0&count=15&maxprice=free&category1=998&specials=1&json=1', {
+        const steamRes = await fetch('https://store.steampowered.com/search/results/?query&start=0&count=15&maxprice=free&category1=998&specials=1&cc=us&json=1', {
             headers: { 'User-Agent': 'Mozilla/5.0' }
         });
         const steamData = await steamRes.json();
-        if (steamData?.results) {
-            for (const item of steamData.results) {
-                if (item.price?.discount_percent === 100) {
-                    freebies.push({
-                        id: `steam_free_${item.id}`,
-                        title: item.name,
-                        store: 'Steam',
-                        discount: 100,
-                        originalPrice: item.price?.original_formatted || 'Paid',
-                        finalPrice: 'FREE',
-                        link: item.url,
-                        image: item.logo || null
-                    });
-                }
+        const steamFreeItems = (steamData?.results || []).filter(item => item.price?.discount_percent === 100);
+
+        if (steamFreeItems.length > 0) {
+            const uaPrices = await getSteamUkrainePrices(steamFreeItems.map(i => i.id));
+            for (const item of steamFreeItems) {
+                freebies.push({
+                    id: `steam_free_${item.id}`,
+                    title: item.name,
+                    store: 'Steam',
+                    discount: 100,
+                    originalPrice: item.price?.original_formatted || 'Paid',
+                    finalPrice: 'FREE',
+                    uaOriginalPrice: uaPrices[item.id]?.original || null,
+                    uaFinalPrice: 'FREE',
+                    link: item.url,
+                    image: item.logo || null
+                });
             }
         }
     } catch (e) {
@@ -591,6 +633,8 @@ async function fetchActiveFreebies() {
                     discount: 100,
                     originalPrice: game.price?.totalPrice?.fmtPrice?.originalPrice || 'Paid',
                     finalPrice: 'FREE',
+                    uaOriginalPrice: null,
+                    uaFinalPrice: null,
                     link: storeLink,
                     image: imageObj?.url || null
                 });
@@ -603,40 +647,47 @@ async function fetchActiveFreebies() {
     return freebies;
 }
 
-// Fetch Steep Discounts (80% - 99% Off on Steam Specials)
+// Fetch Steep Discounts (80% - 99% Off on Steam Specials with US & Ukraine pricing)
 async function fetchActiveDiscounts() {
     let discounts = [];
 
     try {
-        // Query top Steam specials (sorted by Steam's relevance/featured weight so major titles like Skyrim appear first)
-        const steamRes = await fetch('https://store.steampowered.com/search/results/?query&start=0&count=50&category1=998&specials=1&json=1', {
+        const steamRes = await fetch('https://store.steampowered.com/search/results/?query&start=0&count=50&category1=998&specials=1&cc=us&json=1', {
             headers: { 'User-Agent': 'Mozilla/5.0' }
         });
         const steamData = await steamRes.json();
 
-        if (steamData?.results) {
-            for (const item of steamData.results) {
+        const matched = (steamData?.results || [])
+            .filter(item => {
                 const pct = item.price?.discount_percent || 0;
-                if (pct >= MIN_DISCOUNT_PERCENT && pct < 100) {
-                    discounts.push({
-                        id: `steam_disc_${item.id}`,
-                        title: item.name,
-                        store: 'Steam',
-                        discount: pct,
-                        originalPrice: item.price?.original_formatted || 'N/A',
-                        finalPrice: item.price?.final_formatted || 'Discounted',
-                        link: item.url,
-                        image: item.logo || null
-                    });
-                }
+                return pct >= MIN_DISCOUNT_PERCENT && pct < 100;
+            })
+            .sort((a, b) => (b.price?.discount_percent || 0) - (a.price?.discount_percent || 0))
+            .slice(0, 10);
+
+        if (matched.length > 0) {
+            const uaPrices = await getSteamUkrainePrices(matched.map(i => i.id));
+
+            for (const item of matched) {
+                discounts.push({
+                    id: `steam_disc_${item.id}`,
+                    title: item.name,
+                    store: 'Steam',
+                    discount: item.price.discount_percent,
+                    originalPrice: item.price?.original_formatted || 'N/A',
+                    finalPrice: item.price?.final_formatted || 'Discounted',
+                    uaOriginalPrice: uaPrices[item.id]?.original || null,
+                    uaFinalPrice: uaPrices[item.id]?.final || null,
+                    link: item.url,
+                    image: item.logo || null
+                });
             }
         }
     } catch (e) {
         console.error('[Deals] Steam discounts fetch error:', e);
     }
 
-    // Sort highest discount first, capped at top 10
-    return discounts.sort((a, b) => b.discount - a.discount).slice(0, 10);
+    return discounts;
 }
 
 async function checkAllDeals(sock) {
@@ -649,7 +700,7 @@ async function checkAllDeals(sock) {
     const freebies = await fetchActiveFreebies();
     for (const deal of freebies) {
         if (shouldAlertDeal(dealsMap, deal.id, deal.discount)) {
-            const messageText = `🚨 *FREE ${deal.store.toUpperCase()} ALERT!* 🚨\n\n🎮 *${deal.title}*\n🏷️ *Normal Price:* ~${deal.originalPrice}~\n💸 *Now:* *100% FREE!*\n\n🔗 *Store Link:* ${deal.link}`;
+            const messageText = `🚨 *FREE ${deal.store.toUpperCase()} ALERT!* 🚨\n\n🎮 *${deal.title}*\n${formatPriceLines(deal)}\n\n🔗 *Store Link:* ${deal.link}`;
             if (deal.image) {
                 await sock.sendMessage(targetJid, { image: { url: deal.image }, caption: messageText });
             } else {
@@ -664,7 +715,7 @@ async function checkAllDeals(sock) {
     const discounts = await fetchActiveDiscounts();
     for (const deal of discounts) {
         if (shouldAlertDeal(dealsMap, deal.id, deal.discount)) {
-            const messageText = `🔥 *${deal.discount}% OFF STEAM DEAL!* 🔥\n\n🎮 *${deal.title}*\n🏷️ *Original:* ~${deal.originalPrice}~\n💰 *Sale Price:* *${deal.finalPrice}* (-${deal.discount}%)\n\n🔗 *Store Link:* ${deal.link}`;
+            const messageText = `🔥 *${deal.discount}% OFF STEAM DEAL!* 🔥\n\n🎮 *${deal.title}*\n${formatPriceLines(deal)}\n\n🔗 *Store Link:* ${deal.link}`;
             if (deal.image) {
                 await sock.sendMessage(targetJid, { image: { url: deal.image }, caption: messageText });
             } else {
@@ -709,7 +760,7 @@ const commands = {
                   `• \`!sharkny ...\` — Search single titles or browse 5-item paged lists.\n` +
                   `• \`!ai <prompt>\` — Chat with Gemini (supports quoted image/text context).\n` +
                   `• \`!deals free\` — View active 100% free games on Steam & Epic Games.\n` +
-                  `• \`!deals discount\` — View active ${MIN_DISCOUNT_PERCENT}%+ off deep discounts on Steam.\n` +
+                  `• \`!deals discount\` — View active ${MIN_DISCOUNT_PERCENT}%+ off Steam deals (USD & UAH).\n` +
                   `• \`!ping\` — Test bot response time.\n` +
                   `• \`!help sharkny\` — Detailed documentation for Sharkny search & lists.`
         };
@@ -768,7 +819,7 @@ const commands = {
 
             await sock.sendMessage(jid, { text: `🎯 Found *${freebies.length}* active free game(s) right now:` });
             for (const deal of freebies) {
-                const cardText = `🎮 *${deal.title}* (${deal.store})\n🏷️ *Normal Price:* ~${deal.originalPrice}~\n💸 *Price:* *100% FREE*\n\n🔗 *Store Link:* ${deal.link}`;
+                const cardText = `🎮 *${deal.title}* (${deal.store})\n${formatPriceLines(deal)}\n\n🔗 *Store Link:* ${deal.link}`;
                 if (deal.image) {
                     await sock.sendMessage(jid, { image: { url: deal.image }, caption: cardText });
                 } else {
@@ -780,7 +831,7 @@ const commands = {
         }
 
         if (subCmd === 'discount' || subCmd === 'discounts') {
-            await sock.sendMessage(jid, { text: `🔍 Scanning Steam for top ${MIN_DISCOUNT_PERCENT}%+ off discounts...` });
+            await sock.sendMessage(jid, { text: `🔍 Scanning Steam for top ${MIN_DISCOUNT_PERCENT}%+ off discounts (US & Ukraine stores)...` });
             const discounts = await fetchActiveDiscounts();
             if (discounts.length === 0) {
                 return { text: `ℹ️ No featured ${MIN_DISCOUNT_PERCENT}%+ off Steam discounts found right now.` };
@@ -788,7 +839,7 @@ const commands = {
 
             await sock.sendMessage(jid, { text: `🔥 Found *${discounts.length}* deep discount deal(s) (${MIN_DISCOUNT_PERCENT}%+ off):` });
             for (const deal of discounts) {
-                const cardText = `🎮 *${deal.title}* (${deal.store})\n🏷️ *Original:* ~${deal.originalPrice}~\n💰 *Now:* *${deal.finalPrice}* (-${deal.discount}%)\n\n🔗 *Store Link:* ${deal.link}`;
+                const cardText = `🎮 *${deal.title}* (${deal.store})\n${formatPriceLines(deal)}\n\n🔗 *Store Link:* ${deal.link}`;
                 if (deal.image) {
                     await sock.sendMessage(jid, { image: { url: deal.image }, caption: cardText });
                 } else {
@@ -799,7 +850,7 @@ const commands = {
             return;
         }
 
-        return { text: '⚠️ Usage:\n• `!deals free` — Active 100% free games\n• `!deals discount` — Active 80%+ off Steam deals' };
+        return { text: '⚠️ Usage:\n• `!deals free` — Active 100% free games\n• `!deals discount` — Active 80%+ off Steam deals (USD & UAH)' };
     }
 };
 
