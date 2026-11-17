@@ -585,7 +585,7 @@ async function fetchSteamDiscounts() {
     try {
         // sortBy=Deal Rating ensures well-reviewed, real games appear at the top
         const url = 'https://www.cheapshark.com/api/1.0/deals?storeID=1&onSale=1&sortBy=Deal%20Rating&pageSize=60';
-        const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const res = await fetch(url, { headers: { 'User-Agent': 'Sharkny/1.0' } });
         const rawDeals = await res.json();
 
         if (!Array.isArray(rawDeals)) return [];
