@@ -338,7 +338,7 @@ async function searchTMDB(mediaType, rawQuery) {
 async function listTMDBMedia(mediaType, subArg, sock, jid) {
     const tmdbToken = process.env.TMDB_ACCESS_TOKEN;
     if (!tmdbToken) {
-        await sock.sendMessage(jid, { text: '⚠️ TMDB access token is missing in your .env file.' };
+        await sock.sendMessage(jid, { text: '⚠️ TMDB access token is missing in your .env file.' });
         return;
     }
 
@@ -493,12 +493,12 @@ async function handleAI(args, msg, sock) {
 }
 
 // ==========================================
-// 2. FREE GAMES & DEEP DISCOUNTS MONITOR
+// 2. FREE GAMES & DEEP DISCOUNTS (CHEAPSHARK + STEAM)
 // ==========================================
 
 const SENT_DEALS_FILE = './sent_deals.json';
 const DISCOUNT_COOLDOWN_MS = 30 * 24 * 60 * 60 * 1000;
-const MIN_DISCOUNT_PERCENT = 70; // Catch 70% and above
+const MIN_DISCOUNT_PERCENT = 70; // 70% and above
 
 function getDealAlertTargets() {
     const targets = [];
@@ -552,94 +552,120 @@ function shouldAlertDeal(dealsMap, dealKey, currentDiscount) {
     return false;
 }
 
-// Robust Steam Featured Specials fetcher (cc=us for USD, cc=ua for UAH)
-async function fetchSteamFeaturedSpecials() {
-    let dealsMap = {};
+// Batch-fetch Ukrainian Store prices (UAH / ₴) for a list of Steam App IDs
+async function getSteamUkrainePrices(appIds) {
+    const uaMap = {};
+    if (!appIds || appIds.length === 0) return uaMap;
 
     try {
-        // Fetch US Prices & Specials
-        const resUs = await fetch('https://store.steampowered.com/api/featured/?cc=us', {
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
-        const dataUs = await resUs.json();
+        const res = await fetch(
+            `https://store.steampowered.com/api/appdetails?appids=${appIds.join(',')}&cc=ua&filters=price_overview`,
+            { headers: { 'User-Agent': 'Mozilla/5.0' } }
+        );
+        const data = await res.json();
 
-        // Fetch UA Prices
-        const resUa = await fetch('https://store.steampowered.com/api/featured/?cc=ua', {
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
-        const dataUa = await resUa.json();
-
-        const specials = dataUs?.specials || [];
-        const uaSpecialsMap = {};
-        if (dataUa?.specials) {
-            for (const item of dataUa.specials) {
-                uaSpecialsMap[item.id] = item;
-            }
-        }
-
-        for (const item of specials) {
-            const discount = item.discount_percent || 0;
-            if (discount >= MIN_DISCOUNT_PERCENT && discount < 100) {
-                const appId = item.id;
-                const uaItem = uaSpecialsMap[appId] || {};
-
-                // Estimate sale end date if available (Steam often provides banner or end_date timestamp)
-                let endDateStr = 'Limited Time';
-                if (item.discount_expiration) {
-                    endDateStr = new Date(item.discount_expiration * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                }
-
-                dealsMap[appId] = {
-                    id: `steam_disc_${appId}`,
-                    appId: appId,
-                    title: item.name,
-                    store: 'Steam',
-                    discount: discount,
-                    originalPrice: `$${(item.original_price / 100).toFixed(2)}`,
-                    finalPrice: `$${(item.final_price / 100).toFixed(2)}`,
-                    uaOriginalPrice: uaItem.original_price ? `${(uaItem.original_price / 100).toFixed(2)}₴` : null,
-                    uaFinalPrice: uaItem.final_price ? `${(uaItem.final_price / 100).toFixed(2)}₴` : null,
-                    endDate: endDateStr,
-                    link: `https://store.steampowered.com/app/${appId}`,
-                    image: item.large_capsule_image || item.header_image || null
+        for (const id of appIds) {
+            const po = data?.[id]?.data?.price_overview;
+            if (po) {
+                uaMap[id] = {
+                    original: po.initial_formatted || po.final_formatted || null,
+                    final: po.final_formatted || null
                 };
             }
         }
     } catch (e) {
-        console.error('[Deals] Steam featured specials fetch error:', e);
+        console.error('[Deals] Steam Ukraine price lookup error:', e);
     }
 
-    return Object.values(dealsMap).sort((a, b) => b.discount - a.discount);
+    return uaMap;
 }
 
+// Fetch Steam 70%+ off deals reliably via CheapShark API (storeID=1 = Steam) + Steam UA pricing
+async function fetchSteamDiscounts() {
+    try {
+        // sortBy=Deal Rating ensures well-reviewed, real games appear at the top
+        const url = 'https://www.cheapshark.com/api/1.0/deals?storeID=1&onSale=1&sortBy=Deal%20Rating&pageSize=60';
+        const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const rawDeals = await res.json();
+
+        if (!Array.isArray(rawDeals)) return [];
+
+        const filtered = rawDeals
+            .filter(d => {
+                const savings = Math.round(parseFloat(d.savings || '0'));
+                return d.steamAppID && savings >= MIN_DISCOUNT_PERCENT && savings < 100;
+            })
+            .slice(0, 15);
+
+        if (filtered.length === 0) return [];
+
+        // Enrich with Ukrainian Store prices in one batch call
+        const appIds = filtered.map(d => d.steamAppID);
+        const uaPrices = await getSteamUkrainePrices(appIds);
+
+        return filtered.map(d => {
+            const appId = d.steamAppID;
+            const discount = Math.round(parseFloat(d.savings));
+            const ua = uaPrices[appId] || {};
+
+            // CheapShark provides lastChange timestamp (when the current discount started)
+            const startedDate = d.lastChange
+                ? new Date(d.lastChange * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+                : null;
+
+            return {
+                id: `steam_disc_${appId}`,
+                appId,
+                title: d.title,
+                store: 'Steam',
+                discount,
+                originalPrice: `$${d.normalPrice}`,
+                finalPrice: `$${d.salePrice}`,
+                uaOriginalPrice: ua.original || null,
+                uaFinalPrice: ua.final || null,
+                steamRating: d.steamRatingPercent && d.steamRatingPercent !== '0' ? `${d.steamRatingPercent}% (${d.steamRatingText})` : null,
+                startedDate,
+                link: `https://store.steampowered.com/app/${appId}`,
+                image: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`
+            };
+        });
+    } catch (e) {
+        console.error('[Deals] CheapShark Steam discounts error:', e);
+        return [];
+    }
+}
+
+// Fetch 100% Free Games (Steam via CheapShark + Epic Games Store)
 async function fetchActiveFreebies() {
     let freebies = [];
 
+    // 1. Steam 100% Off via CheapShark (upperPrice=0 & onSale=1)
     try {
-        const steamRes = await fetch('https://store.steampowered.com/search/results/?query&start=0&count=15&maxprice=free&category1=998&specials=1&cc=us&json=1', {
+        const res = await fetch('https://www.cheapshark.com/api/1.0/deals?storeID=1&onSale=1&upperPrice=0&pageSize=20', {
             headers: { 'User-Agent': 'Mozilla/5.0' }
         });
-        const steamData = await steamRes.json();
-        const steamFreeItems = (steamData?.results || []).filter(item => item.price?.discount_percent === 100);
-
-        if (steamFreeItems.length > 0) {
-            for (const item of steamFreeItems) {
-                freebies.push({
-                    id: `steam_free_${item.id}`,
-                    title: item.name,
-                    store: 'Steam',
-                    discount: 100,
-                    originalPrice: item.price?.original_formatted || 'Paid',
-                    finalPrice: 'FREE',
-                    link: item.url,
-                    image: item.logo || null
-                });
+        const steamFree = await res.json();
+        if (Array.isArray(steamFree)) {
+            for (const d of steamFree) {
+                if (d.steamAppID && parseFloat(d.normalPrice || '0') > 0) {
+                    freebies.push({
+                        id: `steam_free_${d.steamAppID}`,
+                        title: d.title,
+                        store: 'Steam',
+                        discount: 100,
+                        originalPrice: `$${d.normalPrice}`,
+                        finalPrice: 'FREE',
+                        link: `https://store.steampowered.com/app/${d.steamAppID}`,
+                        image: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${d.steamAppID}/header.jpg`
+                    });
+                }
             }
         }
     } catch (e) {
         console.error('[Deals] Steam freebies fetch error:', e);
     }
 
+    // 2. Epic Games Store 100% Off
     try {
         const epicRes = await fetch('https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions?locale=en-US&country=US&allowCountries=US', {
             headers: { 'User-Agent': 'Mozilla/5.0' }
@@ -672,36 +698,31 @@ async function fetchActiveFreebies() {
     return freebies;
 }
 
-function formatPriceLines(deal) {
-    if (deal.discount === 100) {
-        return `🇺🇸 *US Store:* ~${deal.originalPrice}~ → *100% FREE*`;
-    }
+// Formats all discounted games into a single clean WhatsApp list message
+function formatDiscountListMessage(deals, headerTitle) {
+    const lines = deals.map((d, idx) => {
+        const uaPart = d.uaFinalPrice ? ` | 🇺🇦 *${d.uaFinalPrice}*` : '';
+        const datePart = d.startedDate ? ` _(Since ${d.startedDate})_` : '';
+        return `*${idx + 1}. ${d.title}* — *-${d.discount}%*${datePart}\n` +
+               `   🇺🇸 ~${d.originalPrice}~ → *${d.finalPrice}*${uaPart}\n` +
+               `   🔗 ${d.link}`;
+    });
 
-    let lines = `🇺🇸 *US Store:* ~${deal.originalPrice}~ → *${deal.finalPrice}* (-${deal.discount}%)`;
-    if (deal.uaFinalPrice) {
-        const uaOrig = deal.uaOriginalPrice ? `~${deal.uaOriginalPrice}~ → ` : '';
-        lines += `\n🇺🇦 *UA Store:* ${uaOrig}*${deal.uaFinalPrice}*`;
-    }
-    if (deal.endDate) {
-        lines += `\n⏳ *Ends:* ${deal.endDate}`;
-    }
-    return lines;
+    return `${headerTitle}\n\n${lines.join('\n\n')}\n\n💡 _Tip: Type_ \`!discount <game name>\` _for full game overview, reviews & specs._`;
 }
 
-async function broadcastDealToTargets(sock, targets, deal, messageText) {
+// Broadcasts a message or image card to all target chats with anti-spam intervals between each chat
+async function broadcastToTargets(sock, targets, payload) {
     for (let i = 0; i < targets.length; i++) {
         const targetJid = targets[i];
         try {
-            if (deal.image) {
-                await sock.sendMessage(targetJid, { image: { url: deal.image }, caption: messageText });
-            } else {
-                await sock.sendMessage(targetJid, { text: messageText });
-            }
-            console.log(`[Deals Monitor] Sent "${deal.title}" to ${targetJid}`);
+            await sock.sendMessage(targetJid, payload);
+            console.log(`[Deals Monitor] Sent alert to ${targetJid}`);
         } catch (err) {
-            console.error(`[Deals Monitor] Failed sending "${deal.title}" to ${targetJid}:`, err);
+            console.error(`[Deals Monitor] Failed sending alert to ${targetJid}:`, err);
         }
 
+        // Wait 4 to 6 seconds between sending to the group chat and the private chat
         if (i < targets.length - 1) {
             await sleepJitter(4000, 6000);
         }
@@ -714,25 +735,34 @@ async function checkAllDeals(sock) {
 
     const dealsMap = getSentDealsMap();
 
-    // 1. Check Freebies
+    // 1. Check 100% Freebies (sent individually with cover image)
     const freebies = await fetchActiveFreebies();
     for (const deal of freebies) {
         if (shouldAlertDeal(dealsMap, deal.id, deal.discount)) {
-            const messageText = `🚨 *FREE ${deal.store.toUpperCase()} ALERT!* 🚨\n\n🎮 *${deal.title}*\n${formatPriceLines(deal)}\n\n🔗 *Store Link:* ${deal.link}`;
-            await broadcastDealToTargets(sock, targets, deal, messageText);
+            const messageText = `🚨 *FREE ${deal.store.toUpperCase()} ALERT!* 🚨\n\n🎮 *${deal.title}*\n💸 *Price:* ~${deal.originalPrice}~ → *100% FREE!*\n\n🔗 *Store Link:* ${deal.link}`;
+            const payload = deal.image
+                ? { image: { url: deal.image }, caption: messageText }
+                : { text: messageText };
+
+            await broadcastToTargets(sock, targets, payload);
             saveSentDeal(deal.id, deal.discount);
             await sleepJitter(8000, 12000);
         }
     }
 
-    // 2. Check Deep Discounts (70%+)
-    const discounts = await fetchSteamFeaturedSpecials();
-    for (const deal of discounts) {
-        if (shouldAlertDeal(dealsMap, deal.id, deal.discount)) {
-            const messageText = `🔥 *${deal.discount}% OFF STEAM DEAL!* 🔥\n\n🎮 *${deal.title}*\n${formatPriceLines(deal)}\n\n🔗 *Store Link:* ${deal.link}`;
-            await broadcastDealToTargets(sock, targets, deal, messageText);
+    // 2. Check Deep Discounts (70%+) and send all newly detected deals in ONE consolidated list
+    const discounts = await fetchSteamDiscounts();
+    const newDiscounts = discounts.filter(d => shouldAlertDeal(dealsMap, d.id, d.discount));
+
+    if (newDiscounts.length > 0) {
+        const listText = formatDiscountListMessage(
+            newDiscounts,
+            `🔥 *NEW STEAM DEEP DISCOUNTS (${MIN_DISCOUNT_PERCENT}%+ OFF)* 🔥`
+        );
+        await broadcastToTargets(sock, targets, { text: listText });
+
+        for (const deal of newDiscounts) {
             saveSentDeal(deal.id, deal.discount);
-            await sleepJitter(8000, 12000);
         }
     }
 }
@@ -745,42 +775,75 @@ function startDealsMonitor(sock) {
 
 // On-demand detailed lookup for !discount <gamename>
 async function handleDiscountDetail(gameQuery, sock, jid) {
-    await sock.sendMessage(jid, { text: `🔍 Searching Steam store for discount details on "${gameQuery}"...` });
+    await sock.sendMessage(jid, { text: `🔍 Checking Steam store & pricing for "${gameQuery}"...` });
 
     try {
-        const specials = await fetchSteamFeaturedSpecials();
-        const normTarget = normalizeTitle(gameQuery);
+        // Search Steam store directly so any game works (even if <70% off)
+        const searchRes = await fetch(
+            `https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(gameQuery)}&l=english&cc=us`,
+            { headers: { 'User-Agent': 'Mozilla/5.0' } }
+        );
+        const searchData = await searchRes.json();
+        const firstHit = searchData?.items?.[0];
 
-        const match = specials.find(d => normalizeTitle(d.title).includes(normTarget));
-        if (!match) {
-            await sock.sendMessage(jid, { text: `ℹ️ No active featured discount of ${MIN_DISCOUNT_PERCENT}%+ found matching "${gameQuery}". Use \`!deals discount\` to see the full list.` });
+        if (!firstHit) {
+            await sock.sendMessage(jid, { text: `❌ No Steam game found matching "${gameQuery}".` });
             return;
         }
 
-        // Fetch detailed app info from Steam API for extended info (genres, description, etc.)
-        const detailRes = await fetch(`https://store.steampowered.com/api/appdetails?appids=${match.appId}&cc=us`, {
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
-        const detailData = await detailRes.json();
-        const appInfo = detailData?.[match.appId]?.data;
+        const appId = firstHit.id;
 
-        const desc = appInfo?.short_description ? appInfo.short_description + '...' : 'No description available.';
-        const genres = appInfo?.genres ? appInfo.genres.map(g => g.description).join(', ') : 'N/A';
-        const platforms = appInfo?.platforms ? Object.keys(appInfo.platforms).filter(p => appInfo.platforms[p]).join(', ').toUpperCase() : 'PC';
+        // Fetch full US details + UA price in parallel
+        const [usRes, uaRes] = await Promise.all([
+            fetch(`https://store.steampowered.com/api/appdetails?appids=${appId}&cc=us`, { headers: { 'User-Agent': 'Mozilla/5.0' } }),
+            fetch(`https://store.steampowered.com/api/appdetails?appids=${appId}&cc=ua&filters=price_overview`, { headers: { 'User-Agent': 'Mozilla/5.0' } })
+        ]);
 
-        const caption = `🔥 *Detailed Discount Info* 🔥\n\n` +
-                        `🎮 *${match.title}*\n` +
-                        `🏷️ *Genres:* ${genres}\n` +
-                        `🖥️ *Platforms:* ${platforms}\n\n` +
-                        `${formatPriceLines(match)}\n\n` +
-                        `📝 *Overview:* ${desc}\n\n` +
-                        `🔗 *Store Link:* ${match.link}`;
+        const [usData, uaData] = await Promise.all([usRes.json(), uaRes.json()]);
+        const appInfo = usData?.[appId]?.data;
+        const uaPrice = uaData?.[appId]?.data?.price_overview;
 
-        if (match.image) {
-            await sock.sendMessage(jid, { image: { url: match.image }, caption: caption });
-        } else {
-            await sock.sendMessage(jid, { text: caption });
+        if (!appInfo) {
+            await sock.sendMessage(jid, { text: `❌ Could not load Steam store details for "${firstHit.name}".` });
+            return;
         }
+
+        const title = appInfo.name || firstHit.name;
+        const po = appInfo.price_overview;
+        const desc = appInfo.short_description ? appInfo.short_description.slice(0, 280) + '...' : 'No description available.';
+        const genres = appInfo.genres ? appInfo.genres.map(g => g.description).join(', ') : 'N/A';
+        const releaseDate = appInfo.release_date?.date || 'Unknown';
+        const metacritic = appInfo.metacritic?.score ? `${appInfo.metacritic.score}/100` : 'N/A';
+
+        let priceBlock = '';
+        if (appInfo.is_free) {
+            priceBlock = '💸 *Price:* Free to Play';
+        } else if (po) {
+            if (po.discount_percent > 0) {
+                priceBlock = `🔥 *Discount:* *-${po.discount_percent}% OFF*\n🇺🇸 *US Store:* ~${po.initial_formatted}~ → *${po.final_formatted}*`;
+                if (uaPrice) {
+                    priceBlock += `\n🇺🇦 *UA Store:* ~${uaPrice.initial_formatted}~ → *${uaPrice.final_formatted}*`;
+                }
+            } else {
+                priceBlock = `💰 *US Store:* *${po.final_formatted}* _(No active discount)_`;
+                if (uaPrice) {
+                    priceBlock += `\n🇺🇦 *UA Store:* *${uaPrice.final_formatted}*`;
+                }
+            }
+        } else {
+            priceBlock = '💰 *Price:* Not available';
+        }
+
+        const caption =
+            `🎮 *${title}* (${releaseDate})\n\n` +
+            `${priceBlock}\n\n` +
+            `⭐ *Metacritic:* ${metacritic}\n` +
+            `🏷️ *Genres:* ${genres}\n\n` +
+            `📝 *Overview:* ${desc}\n\n` +
+            `🔗 *Steam Store:* https://store.steampowered.com/app/${appId}`;
+
+        const headerImg = appInfo.header_image || `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`;
+        await sock.sendMessage(jid, { image: { url: headerImg }, caption });
     } catch (e) {
         console.error('Discount Detail Error:', e);
         await sock.sendMessage(jid, { text: '❌ Failed to fetch detailed discount information from Steam.' });
@@ -815,8 +878,8 @@ const commands = {
                   `• \`!sharkny ...\` — Search single titles or browse 5-item paged lists.\n` +
                   `• \`!ai <prompt>\` — Chat with Gemini (supports quoted image/text context).\n` +
                   `• \`!deals free\` — View active 100% free games on Steam & Epic Games.\n` +
-                  `• \`!deals discount\` — View active ${MIN_DISCOUNT_PERCENT}%+ off Steam deals list (USD & UAH).\n` +
-                  `• \`!discount <gamename>\` — Get deep extended discount & game info.\n` +
+                  `• \`!deals discount\` — List all active ${MIN_DISCOUNT_PERCENT}%+ off Steam deals (USD & UAH).\n` +
+                  `• \`!discount <gamename>\` — Get detailed price, discount & game info for any Steam game.\n` +
                   `• \`!ping\` — Test bot response time.\n` +
                   `• \`!help sharkny\` — Detailed documentation for Sharkny search & lists.`
         };
@@ -883,7 +946,7 @@ const commands = {
 
             await sock.sendMessage(jid, { text: `🎯 Found *${freebies.length}* active free game(s) right now:` });
             for (const deal of freebies) {
-                const cardText = `🎮 *${deal.title}* (${deal.store})\n${formatPriceLines(deal)}\n\n🔗 *Store Link:* ${deal.link}`;
+                const cardText = `🎮 *${deal.title}* (${deal.store})\n💸 *Price:* ~${deal.originalPrice}~ → *100% FREE*\n\n🔗 *Store Link:* ${deal.link}`;
                 if (deal.image) {
                     await sock.sendMessage(jid, { image: { url: deal.image }, caption: cardText });
                 } else {
@@ -895,29 +958,20 @@ const commands = {
         }
 
         if (subCmd === 'discount' || subCmd === 'discounts') {
-            await sock.sendMessage(jid, { text: `🔍 Scanning Steam featured specials for ${MIN_DISCOUNT_PERCENT}%+ off discounts (US & Ukraine stores)...` });
-            const discounts = await fetchSteamFeaturedSpecials();
+            await sock.sendMessage(jid, { text: `🔍 Fetching active ${MIN_DISCOUNT_PERCENT}%+ off Steam discounts (US & Ukraine stores)...` });
+            const discounts = await fetchSteamDiscounts();
             if (discounts.length === 0) {
-                return { text: `ℹ️ No featured ${MIN_DISCOUNT_PERCENT}%+ off Steam discounts found right now.` };
+                return { text: `ℹ️ No ${MIN_DISCOUNT_PERCENT}%+ off Steam discounts found right now.` };
             }
 
-            await sock.sendMessage(jid, { text: `🔥 Found *${discounts.length}* deep discount deal(s) (${MIN_DISCOUNT_PERCENT}%+ off):\n*(Tip: Use \`!discount <gamename>\` for deep extended info on any game)*` });
-            
-            // Send as a clean consolidated summary list or card stream
-            for (let i = 0; i < Math.min(discounts.length, 10); i++) {
-                const deal = discounts[i];
-                const cardText = `*${i + 1}. ${deal.title}* (-${deal.discount}%)\n${formatPriceLines(deal)}\n🔗 ${deal.link}`;
-                if (deal.image) {
-                    await sock.sendMessage(jid, { image: { url: deal.image }, caption: cardText });
-                } else {
-                    await sock.sendMessage(jid, { text: cardText });
-                }
-                await sleepJitter(1500, 2500);
-            }
-            return;
+            const listText = formatDiscountListMessage(
+                discounts,
+                `🔥 *ACTIVE STEAM DISCOUNTS (${MIN_DISCOUNT_PERCENT}%+ OFF)* 🔥`
+            );
+            return { text: listText };
         }
 
-        return { text: '⚠️ Usage:\n• `!deals free` — Active 100% free games\n• `!deals discount` — Active 70%+ off Steam deals list\n• `!discount <gamename>` — Deep extended info for a specific game' };
+        return { text: '⚠️ Usage:\n• `!deals free` — Active 100% free games\n• `!deals discount` — List all active 70%+ off Steam deals\n• `!discount <gamename>` — Detailed info for any Steam game' };
     }
 };
 
